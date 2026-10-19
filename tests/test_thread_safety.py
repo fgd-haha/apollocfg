@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import requests
 import requests_mock
@@ -165,3 +166,98 @@ def test_rotation_without_meta_server_returns_false():
         )
         assert client._rotate_config_url() is False
         assert client.config_url == HOST_A, "无处可换时不应改动原地址"
+
+
+def test_stop_join_timeout_does_not_spawn_duplicate_thread():
+    """stop() 的 join 超时后再 start()，不能出现两个轮询线程。
+
+    线程引用在 join 超时时必须保留——丢掉引用就无从判断旧线程是否还活着，
+    下一次 start() 会把尚未退出的旧线程"放行"，形成重复拉取与重复回调。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        m.get(f"{HOST_A}/notifications/v2", status_code=304)
+        client = ApolloClient(
+            app_id="unit-app",
+            config_url=HOST_A,
+            poll_timeout=61,
+            request_timeout=1,
+            poll_interval=0.01,
+        )
+        client.start()
+        client.stop(timeout=0)
+        client.start()
+        names = [t.name for t in threading.enumerate() if t.name == "apollocfg-long-poll"]
+        client.stop()
+
+    assert len(names) <= 1, f"出现重复轮询线程: {len(names)}"
+
+
+def test_concurrent_start_creates_single_thread():
+    """并发 start() 只能产生一个轮询线程。"""
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        m.get(f"{HOST_A}/notifications/v2", status_code=304)
+        client = ApolloClient(
+            app_id="unit-app",
+            config_url=HOST_A,
+            poll_timeout=61,
+            request_timeout=1,
+            poll_interval=0.01,
+        )
+        threads = [threading.Thread(target=client.start) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        poll_threads = [
+            t.name for t in threading.enumerate() if t.name == "apollocfg-long-poll"
+        ]
+        client.stop()
+
+    assert len(poll_threads) == 1, f"并发 start 产生了 {len(poll_threads)} 个线程"
+
+
+def test_stop_from_within_callback_does_not_deadlock():
+    """在变更回调里调 stop() 不应因 join 自己而抛 RuntimeError。"""
+    errors = []
+
+    def stopper(namespace, changes):
+        try:
+            client.stop(timeout=1)
+        except Exception as exc:
+            errors.append(exc)
+
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            [
+                {"json": config_payload({"K": "V1"}, "rk1")},
+                {"json": config_payload({"K": "V2"}, "rk2")},
+            ],
+        )
+        m.get(
+            f"{HOST_A}/notifications/v2",
+            json=[{"namespaceName": "application", "notificationId": 11}],
+        )
+        client = ApolloClient(
+            app_id="unit-app",
+            config_url=HOST_A,
+            poll_timeout=61,
+            request_timeout=1,
+            poll_interval=0.01,
+        )
+        client.register_callback(stopper)
+        client.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and client.running:
+            time.sleep(0.02)
+        client.stop(timeout=2)
+
+    assert not errors, f"回调内 stop() 抛异常: {errors}"

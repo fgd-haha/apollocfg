@@ -32,11 +32,13 @@ import random
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import requests
 from requests import Request
 
 from apollocfg.errors import (
+    ApolloError,
     ApolloProtocolError,
     ConfigServiceUnavailable,
     RequiredKeysMissing,
@@ -79,9 +81,14 @@ def _normalize_keys(
     if isinstance(value, Mapping):
         result = {ns: set() for ns in namespaces}
         for ns, keys in value.items():
-            result.setdefault(ns, set()).update(keys or ())
+            # 同样对裸字符串特判，避免 {"ns": "KEY"} 被拆成字符
+            result.setdefault(ns, set()).update(
+                [keys] if isinstance(keys, str) else (keys or ())
+            )
         return result
-    flat = set(value)
+    # 裸字符串要特判：set("MYSQL_DSN") 会拆成 {'M','Y','S',...}，
+    # 调用方写 required_keys="MYSQL_DSN" 是很自然的笔误。
+    flat = {value} if isinstance(value, str) else set(value)
     return {ns: set(flat) for ns in namespaces}
 
 
@@ -148,6 +155,7 @@ class ApolloClient:
         self.meta_server = meta_server.rstrip("/") if meta_server else None
         self._config_url = config_url.rstrip("/") if config_url else None
         self._service_pool: List[str] = []
+        self._rotations = 0
 
         self.required_keys = _normalize_keys(required_keys, self.namespaces)
         self.frozen_keys = _normalize_keys(frozen_keys, self.namespaces)
@@ -173,6 +181,11 @@ class ApolloClient:
         self._started = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # 串行化 start/stop，避免并发调用产生两个轮询线程，
+        # 或 stop() join 超时后 start() 把尚未退出的旧线程"放行"。
+        self._lifecycle_lock = threading.RLock()
+        # 复用连接：长轮询每 60s 一轮，新建 TCP+TLS 是无谓开销
+        self._session = requests.Session()
 
     # ------------------------- 对外 API -------------------------
     def register_callback(self, cb: ChangeCallback) -> ChangeCallback:
@@ -264,8 +277,21 @@ class ApolloClient:
             RequiredKeysMissing: ``required_keys`` 未解析出值（见 ``require_resolved_keys``）。
             StartupAssertionFailed: ``on_resolved`` 拒绝了最终配置。
         """
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if self._started:
             return
+        if self._thread is not None and self._thread.is_alive():
+            # 上一轮的线程还没退出（stop() 的 join 超时了）。再起一个会变成
+            # 两个线程同时轮询、重复派发回调，所以先等它真正结束。
+            self._thread.join(timeout=self.poll_timeout + 5)
+            if self._thread.is_alive():
+                raise ApolloError(
+                    "上一轮长轮询线程仍未退出，拒绝重复启动"
+                )
+            self._thread = None
 
         failures: Dict[str, Exception] = {}
         for ns in self.namespaces:
@@ -273,6 +299,11 @@ class ApolloClient:
                 self._fetch_namespace(ns, initial=True)
             except Exception as exc:  # noqa: BLE001 - 汇总后按策略统一处理
                 failures[ns] = exc
+
+        # 拉取失败的 namespace 也要建冻结快照，否则 effective_configs 会把
+        # "声明冻结但未捕获"的 key 当成无值删掉——于是静态兜底值消失，
+        # 哨兵断言拿不到哨兵值反而放行，正是要防的那个故障。
+        self._capture_pending_frozen()
 
         if failures and len(failures) == len(self.namespaces):
             # 所有 namespace 都失败，视为 Config Service 整体不可用
@@ -316,12 +347,29 @@ class ApolloClient:
         )
 
     def stop(self, timeout: float = 5.0) -> None:
-        """停止长轮询线程。可重复调用。"""
-        self._stop_event.set()
-        self._started = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        self._thread = None
+        """停止长轮询线程。可重复调用。
+
+        join 超时时**保留**线程引用——下一次 ``start()`` 需要知道旧线程还活着，
+        否则会出现两个线程同时轮询。
+        """
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._started = False
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                self._thread = None
+                return
+            if thread is threading.current_thread():
+                # 在变更回调里调 stop() 会 join 自己，直接抛 RuntimeError
+                logger.warning("在轮询线程内调用 stop()，跳过 join")
+                return
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "长轮询线程在 %.1fs 内未退出，保留引用等待下次 start 时回收", timeout
+                )
+            else:
+                self._thread = None
 
     def __enter__(self) -> ApolloClient:
         self.start()
@@ -329,6 +377,54 @@ class ApolloClient:
 
     def __exit__(self, *exc_info: object) -> None:
         self.stop()
+
+    def close(self) -> None:
+        """停止轮询并释放 HTTP 连接池。``stop()`` 之后客户端还可以再 start，
+        ``close()`` 之后不应再使用。"""
+        self.stop()
+        self._session.close()
+
+    # ------------------------- 冻结快照 -------------------------
+    def _capture_frozen(self, namespace: str, apollo_configs: Mapping[str, str]) -> None:
+        """为一个 namespace 建立冻结快照。只建一次，重复调用无效。
+
+        两份快照分开存，避免 ``static_fallback`` 泄漏进只应反映 Apollo 的视图：
+
+          - ``_frozen_snapshot``  —— Apollo 侧的值，供 ``get_configs`` / ``get_value``
+          - ``_frozen_effective`` —— 最终生效值（Apollo 无值时回落静态兜底），
+            供 ``effective_configs``
+        """
+        with self._lock:
+            if namespace in self._frozen_captured:
+                return
+            static = self.static_fallback.get(namespace, {})
+            declared = self.frozen_keys.get(namespace, set())
+            apollo_frozen = {
+                key: apollo_configs[key]
+                for key in declared
+                if (apollo_configs.get(key) or "").strip()
+            }
+            effective_frozen = dict(apollo_frozen)
+            for key in declared:
+                if key not in effective_frozen and key in static:
+                    effective_frozen[key] = static[key]
+
+            self._frozen_snapshot[namespace] = apollo_frozen
+            self._frozen_effective[namespace] = effective_frozen
+            self._frozen_captured.add(namespace)
+            if declared:
+                logger.info(
+                    "namespace=%s 已冻结 %d 个声明 key（禁止热更新），其中 %d 个有值",
+                    namespace,
+                    len(declared),
+                    len(effective_frozen),
+                )
+
+    def _capture_pending_frozen(self) -> None:
+        """为启动时拉取失败的 namespace 补建冻结快照（只有静态兜底值可用）。"""
+        for ns in self.namespaces:
+            if ns not in self._frozen_captured:
+                self._capture_frozen(ns, self.get_configs(ns))
 
     # ------------------------- 契约校验 -------------------------
     def _check_required_keys(self) -> None:
@@ -447,6 +543,7 @@ class ApolloClient:
                     self._service_pool = discovered
             if not candidates:
                 return False
+            self._rotations += 1
             self._config_url = candidates[0]
             # 把失败的实例挪到队尾，下次优先试其他的
             self._service_pool = candidates + ([failed] if failed else [])
@@ -483,7 +580,7 @@ class ApolloClient:
         """
         prepared = Request("GET", url, params=params).prepare()
         headers = self._auth_headers(prepared.path_url)
-        return requests.get(prepared.url, headers=headers, timeout=timeout)
+        return self._session.get(prepared.url, headers=headers, timeout=timeout)
 
     # ------------------------- 配置拉取 -------------------------
     def _fetch_namespace(
@@ -509,46 +606,16 @@ class ApolloClient:
                 f"namespace={namespace} 返回 HTTP {resp.status_code} 但 body 为空"
             )
 
-        data = resp.json()
-        new_configs: Dict[str, str] = data.get("configurations") or {}
-        new_release = data.get("releaseKey") or ""
+        new_configs, new_release = self._parse_config_payload(namespace, resp)
+
+        if initial:
+            self._capture_frozen(namespace, new_configs)
 
         with self._lock:
             old_configs = self._configs.get(namespace, {})
             raw_changes = self._diff(old_configs, new_configs)
             self._configs[namespace] = new_configs
             self._release_keys[namespace] = new_release
-
-            if initial and namespace not in self._frozen_captured:
-                # 启动时为 frozen_keys 建快照：此后这些 key 的返回值固定不变。
-                # 只建一次——start/stop/start 不重建，否则冻结值会跳变。
-                #
-                # 两份快照：Apollo 侧的值进 _frozen_snapshot（供 get_configs），
-                # 最终生效值（Apollo 无值时回落静态兜底）进 _frozen_effective
-                # （供 effective_configs）。分开存是为了不让 static_fallback
-                # 泄漏进"只反映 Apollo"的视图。
-                static = self.static_fallback.get(namespace, {})
-                declared = self.frozen_keys.get(namespace, set())
-                apollo_frozen = {
-                    key: new_configs[key]
-                    for key in declared
-                    if (new_configs.get(key) or "").strip()
-                }
-                effective_frozen = dict(apollo_frozen)
-                for key in declared:
-                    if key not in effective_frozen and key in static:
-                        effective_frozen[key] = static[key]
-
-                self._frozen_snapshot[namespace] = apollo_frozen
-                self._frozen_effective[namespace] = effective_frozen
-                self._frozen_captured.add(namespace)
-                if declared:
-                    logger.info(
-                        "namespace=%s 已冻结 %d 个声明 key（禁止热更新），其中 %d 个有值",
-                        namespace,
-                        len(declared),
-                        len(effective_frozen),
-                    )
 
             # frozen_keys 对调用方不可见地变化，不该出现在回调里。
             #
@@ -572,6 +639,43 @@ class ApolloClient:
             self._dispatch(namespace, changes)
         return changes
 
+    @staticmethod
+    def _parse_config_payload(
+        namespace: str, resp: requests.Response
+    ) -> tuple[Dict[str, str], str]:
+        """严格校验并解析配置响应体。
+
+        不能用 ``data.get("configurations") or {}`` 了事：代理返回的
+        ``200 {"error": ...}`` 会被解释成"该 namespace 配置为空"，于是内存配置
+        被清空、diff 产出一堆删除变更并派发给调用方——一次代理故障就可能让
+        运行中的服务按"配置全删了"去拆资源。
+        """
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ApolloProtocolError(
+                f"namespace={namespace} 响应不是合法 JSON"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise ApolloProtocolError(
+                f"namespace={namespace} 响应顶层应为对象，实际是 {type(data).__name__}"
+            )
+        configurations = data.get("configurations")
+        if not isinstance(configurations, dict):
+            raise ApolloProtocolError(
+                f"namespace={namespace} 响应缺少 configurations 对象"
+                f"（实际 {type(configurations).__name__}）"
+            )
+        release_key = data.get("releaseKey")
+        if release_key is not None and not isinstance(release_key, str):
+            raise ApolloProtocolError(
+                f"namespace={namespace} releaseKey 应为字符串"
+            )
+        # 值统一成字符串：Apollo 的 properties namespace 只会给字符串，
+        # 但 json/yaml 格式的 namespace 可能给出别的标量类型。
+        return {str(k): str(v) for k, v in configurations.items()}, release_key or ""
+
     def _request_with_failover(self, namespace: str) -> requests.Response:
         """拉取配置，失败时依次尝试服务池里所有未试过的实例。
 
@@ -590,6 +694,7 @@ class ApolloClient:
         """
         attempted: List[str] = []
         last_error: Optional[BaseException] = None
+        refreshed = False
 
         while True:
             base = self._ensure_config_url()
@@ -616,19 +721,41 @@ class ApolloClient:
 
             if not self._rotate_config_url():
                 break
-            # 轮换后若池里已无未试过的实例，不必再绕一圈
             if all(host in attempted for host in self._known_hosts()):
-                break
+                # 池里所有实例都试过且都失败了。整批实例可能已被滚动替换，
+                # 强制重新发现一次；拿到新地址就继续试，否则放弃。
+                if refreshed or not self._refresh_service_pool(exclude=attempted):
+                    break
+                refreshed = True
 
         assert last_error is not None  # 循环至少执行一次，要么 return 要么置 last_error
         raise last_error
+
+    def _refresh_service_pool(self, exclude: Sequence[str]) -> bool:
+        """强制重新查询 meta server。返回是否发现了未试过的新实例。"""
+        if not self.meta_server:
+            return False
+        discovered = self._discover_services()
+        fresh = [host for host in discovered if host not in exclude]
+        if not fresh:
+            return False
+        with self._addr_lock:
+            self._service_pool = fresh + [h for h in discovered if h in exclude]
+            self._config_url = fresh[0]
+        logger.warning("服务池整批失效，重新发现后换到 %s", fresh[0])
+        return True
 
     def _known_hosts(self) -> List[str]:
         with self._addr_lock:
             return list(self._service_pool)
 
     def _request_namespace(self, base: str, namespace: str) -> requests.Response:
-        url = f"{base}/configs/{self.app_id}/{self.cluster}/{namespace}"
+        # 路径段必须编码：含 / 或空格的 namespace 会改变 URL 结构，
+        # 也会让签名用的 path 和服务端解析的不一致。
+        url = (
+            f"{base}/configs/{quote(self.app_id, safe='')}"
+            f"/{quote(self.cluster, safe='')}/{quote(namespace, safe='')}"
+        )
         params: Dict[str, Any] = {}
         release_key = self._release_keys.get(namespace)
         if release_key:
@@ -641,7 +768,8 @@ class ApolloClient:
         """派发变更回调。单个回调抛异常不影响其他回调，也不中断轮询。"""
         for cb in list(self._callbacks):
             try:
-                cb(namespace, changes)
+                # 传副本：前一个回调若改动 changes 不应影响后续回调
+                cb(namespace, dict(changes))
             except Exception:
                 logger.exception("配置变更回调执行失败 namespace=%s", namespace)
 
@@ -718,22 +846,47 @@ class ApolloClient:
         if resp.status_code == 304:
             return None
         resp.raise_for_status()
-        items = resp.json() or []
+        try:
+            items = resp.json() or []
+        except ValueError as exc:
+            raise ApolloProtocolError("notifications 响应不是合法 JSON") from exc
+        if not isinstance(items, list):
+            raise ApolloProtocolError(
+                f"notifications 响应应为数组，实际是 {type(items).__name__}"
+            )
         if not items:
             return None
 
         updated: List[str] = []
+        failed: List[str] = []
         for item in items:
+            if not isinstance(item, dict):
+                continue
             ns = item.get("namespaceName")
             nid = item.get("notificationId")
-            if ns is None or nid is None:
+            if ns is None or not isinstance(nid, int) or isinstance(nid, bool):
                 continue
-            if nid <= self._notification_ids.get(ns, -1):
+            # 用"不相等"而不是"更大"：Config Service 重启或轮换到别的实例后，
+            # 服务端的 notificationId 可能比客户端持有的更小。要求单调递增会
+            # 让这种情况下的热更新永久失效。
+            if nid == self._notification_ids.get(ns, -1):
                 continue
-            self._notification_ids[ns] = nid
             try:
                 self._fetch_namespace(ns)
+                # 只在拉取成功后推进 id。先推进再拉取的话，一次 5xx 就会让
+                # 客户端"认为自己已追平"，后续长轮询只收到 304，这次发布
+                # 永远不会再被拉取。
+                self._notification_ids[ns] = nid
                 updated.append(ns)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("通知触发后拉取失败 namespace=%s: %s", ns, exc)
+                failed.append(ns)
+
+        if failed and not updated:
+            # id 没推进，服务端下一轮会立刻再返回同一个通知。此时必须让调用方
+            # 走退避路径，否则就是无间隔的忙循环。
+            raise ConfigServiceUnavailable(
+                f"notification fetch failed for: {sorted(failed)}",
+                self._attempted_hosts(),
+            )
         return updated
