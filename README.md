@@ -1,122 +1,292 @@
-# apollo-config-client
+# apollocfg
 
 一个**轻量、同步、贴近 Apollo 官方 HTTP API** 的 Python 配置中心客户端。
 
-> 直接基于 Apollo 开放的 HTTP 接口实现，不依赖任何第三方 Apollo 专用客户端，版本兼容性最好，且对热更新逻辑完全可控。官方 Java / .NET 客户端底层使用的也是同一套接口，可稳定对接 Apollo 1.6 – 2.4.1。
-
-## 特性
-
-| 能力 | 说明 |
-|------|------|
-| 长轮询热更新 | 后台守护线程长轮询 `notifications/v2`，配置发布后**秒级生效**，并给出 key 级 diff |
-| 本地容灾缓存 | 每次成功拉取都落盘；Apollo 全部不可用时，应用仍可用上一次的配置启动 |
-| 访问密钥签名 | 兼容 Apollo 1.6+ 的 `Access Key` HMAC-SHA1 签名（匿名访问同样支持） |
-| 类型化读取 | `get_typed(namespace, Model)` 用任意模型类（如 pydantic）解析配置 |
-| 极简依赖 | **核心仅依赖 `requests`**；pydantic 模型与 Oracle 助手都是可选 extra |
-
-## 安装
+只依赖 `requests`。长轮询热更新、meta server 服务发现、配置契约（必需 / 冻结）、
+访问密钥签名，以及**日志绝不输出配置值**。
 
 ```bash
-pip install apollo-config-client            # 核心（仅 requests）
-pip install apollo-config-client[models]    # + pydantic 领域模型 DatabaseConfig / LdapConfig
-pip install apollo-config-client[oracle]    # + init_oracle_thick_mode 助手
-pip install apollo-config-client[all]       # 以上全部
+pip install apollocfg
 ```
 
-> 发布前请先在 https://pypi.org 确认包名 `apollo-config-client` 可用；若被占用，备选 `apolloc` / `apollo-config`。
+## 为什么又写一个
+
+Apollo 官方只维护 Java 和 .NET 客户端（Go 的 [agollo](https://github.com/apolloconfig/agollo)
+已被官方收编），Python 侧全是第三方实现。实测几个主流包后发现两类问题：
+
+| 问题 | 实际表现 |
+|---|---|
+| 客户端读超时 < 服务端挂起时长 | 服务端长轮询挂 60s，客户端设 35s，**第一轮必然 ReadTimeout**；异常未捕获时轮询线程直接死掉，此后配置永不更新且无任何报错 |
+| 日志打印整份配置 | `logger.info(..., repr(configs))` 把数据库密码、API token 刷进集中式日志系统，长期留存可检索 |
+| 定时拉取冒充长轮询 | 文档写"实时更新"，实现是每 30s 全量拉一次；延迟 0~30s，且不带 `releaseKey` 拿不到 304 |
+
+本库针对这些点做了明确约束：构造函数校验 `poll_timeout > 60`；轮询循环最外层兜住
+所有异常，线程永不退出；任何日志级别都只输出 key 名。
 
 ## 快速开始
 
 ```python
-from apollo_config import create_config_manager_from_env
+from apollocfg import ApolloClient
 
-# 读环境变量 APOLLO_APP_ID / APOLLO_CONFIG_URL / APOLLO_NAMESPACES ...
-cm = create_config_manager_from_env()
+client = ApolloClient(
+    app_id="your-app-id",
+    meta_server="http://apollo-meta.example.com",   # 或 config_url=...
+    namespaces=["application"],
+)
+client.start()
 
-# 普通读取
-cm.get_configs("application")
-cm.get_value("feature_flag", "off")
+client.get_value("FEATURE_FLAG", default="off")
+client.get_configs("application")
 
-# 订阅 namespace 变更，配置一发布即刻拿到 key 级 diff
-@cm.on_namespace_change("database")
-def _on_db_change(namespace, changes):
-    # 这里只做「置空 / 标记失效」等轻量操作，
-    # 真正的资源重建放到请求路径上惰性执行（避免回调里做重 IO）
-    rebuild_connection_pool_lazily()
+@client.register_callback
+def on_change(namespace, changes):
+    # changes = {key: {"old": ..., "new": ...}}
+    print(namespace, sorted(changes))
+
+client.stop()
 ```
 
-显式参数创建（不走环境变量）：
+也可用上下文管理器：
 
 ```python
-from apollo_config import create_config_manager
+with ApolloClient(app_id="app", meta_server="http://meta.example.com") as client:
+    client.get_value("KEY")
+```
 
-cm = create_config_manager(
-    app_id="my-app",
-    config_url="http://apollo-config-service:8080",
-    namespaces=["application", "database"],
-    access_key_secret="38fdae497a324263a5ad81aa387deee3",  # 可选
+## 三组正交语义
+
+这是本库与其他 Python 客户端的主要差别。三者解决的是不同问题，可以任意组合。
+
+### `required_keys` —— 必须来自 Apollo
+
+声明哪些 key 必须从配置中心解析出非空值。拿不到就是契约违约。
+
+```python
+client = ApolloClient(
+    app_id="app",
+    meta_server="http://meta.example.com",
+    required_keys=["MYSQL_DSN", "REDIS_URL"],
+    allow_fallback=False,
+)
+client.start()   # 缺失则抛 RequiredKeysMissing
+```
+
+为什么需要它：比"Apollo 整体宕机"概率高得多的失败是**漏发一个 key、或 key 名拼错一个字母**。
+前者是全局的、看得见的；后者是局部的、静默的。`required_keys` 把后者变成启动期的硬失败。
+
+值为空白字符串视为未解析出值。支持按 namespace 指定：
+
+```python
+required_keys={"application": ["A"], "database": ["DSN", "POOL"]}
+```
+
+### `frozen_keys` —— 禁止热更新
+
+声明哪些 key 在进程生命周期内冻结：启动时快照，之后 Apollo 怎么变都不影响读取结果，
+变更也不会出现在回调里。
+
+```python
+client = ApolloClient(
+    app_id="app",
+    meta_server="http://meta.example.com",
+    frozen_keys=["MYSQL_DSN", "REDIS_URL"],
 )
 ```
 
-### 用 pydantic 模型读取（可选 extra `[models]`）
+为什么需要它：数据库和 Redis 的连接池在启动时按当时的配置建好，之后改配置**不会**让
+已有连接重连。此时让 `get_value()` 返回新值是有害的——会出现"配置显示新地址、连接还在
+老地址"，更糟的是某些 lazy 初始化的客户端会用新值建连接，于是新旧连接并存。
+
+冻结语义是"锁住启动时拿到的值"。如果启动时 Apollo 里就没有这个 key，就没有值可锁，
+后续出现时即可见——想保证"必须拿到"用 `required_keys`，两者配合使用。
+
+### `allow_fallback` —— 不可达时是否降级
 
 ```python
-from apollo_config.contrib import DatabaseConfig
-
-cfg = cm.get_typed("database", DatabaseConfig)
-engine = create_engine(cfg.connection_url(), pool_size=cfg.pool_size)
+allow_fallback=True    # 默认。Apollo 不可达时告警降级，由调用方静态配置兜底
+allow_fallback=False   # Apollo 不可达时抛 ConfigServiceUnavailable，拒绝启动
 ```
 
-## 设计要点
+适用场景不同：有些部署环境（比如和配置中心网络不通的旧环境）本来就读不到 Apollo，
+需要用代码里的静态配置正常运行；而切换窗口期的新环境必须确保配置来自 Apollo。
 
-1. **直接调用 Apollo 开放 HTTP API**（官方客户端同款接口）：
-   - 配置拉取：`GET {config_url}/configs/{appId}/{cluster}/{namespace}`
-   - 变更通知：`GET {config_url}/notifications/v2`（HTTP 长轮询，秒级生效）
-2. **热更新机制**：后台守护线程长轮询 `notifications/v2`，一旦 Apollo 发布新配置，
-   客户端拉取最新值并计算 key 级 diff，触发业务注册的回调。
-3. **本地容灾缓存**：每次成功拉取都会落盘到缓存目录；即使 Apollo 全部不可用，
-   应用也能用上一次的配置正常启动。
-4. **访问密钥签名**：配置 `access_key_secret` 后，对 `configs` 与 `notifications/v2`
-   两类请求统一做 HMAC-SHA1 加签；留空则走匿名访问，行为完全一致。
+### `on_resolved` —— 启动断言
 
-## 环境变量（用于 `create_config_manager_from_env`）
+`allow_fallback=True` 有个隐含风险：**回退到静态配置，可能回退到一份错误的配置**。
 
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `APOLLO_APP_ID` | 应用 AppId | `apollo-app` |
-| `APOLLO_CONFIG_URL` | Config Service 地址（非 Portal 的 8070） | `http://localhost:8080` |
-| `APOLLO_CLUSTER` | 集群 | `default` |
+解法是在静态配置里放哨兵占位符，启动时断言最终生效的值不是哨兵：
+
+```python
+def reject_sentinel(namespace, configs):
+    if configs.get("MYSQL_DSN") == "APOLLO_REQUIRED":
+        return "MYSQL_DSN 仍是哨兵值，Apollo 未下发真实配置"
+    return None   # 返回 None 或 "" 表示通过
+
+client = ApolloClient(..., on_resolved=reject_sentinel)
+client.start()   # 断言失败抛 StartupAssertionFailed
+```
+
+断言在降级**之后**执行，所以它能挡住"Apollo 没拉到、回退到哨兵"这条路径。
+
+这比依赖 `allow_fallback=False` 更稳：后者要求"开关必须被正确设置"，而哨兵值即使开关
+丢失也会失败。
+
+## 服务发现
+
+给 `meta_server` 时，客户端先查 `GET {meta}/services/config` 拿到 Config Service
+实例列表，随机选一个（避免所有客户端都打到第一个），请求失败时自动轮换到其他实例。
+
+```python
+ApolloClient(app_id="app", meta_server="http://apollo-meta.example.com")
+```
+
+给 `config_url` 则直连，不做服务发现。两个都给时以 `config_url` 为首选地址，
+`meta_server` 作为轮换来源。
+
+## 为什么是长轮询
+
+Apollo 没有服务端主动推送。客户端发起 `GET /notifications/v2` 后，服务端用
+Servlet 3.0 异步 + Spring `DeferredResult` 把请求挂起（硬编码 60s）；期间有变更就
+立即返回新的 `notificationId`，无变更则超时返回 304，客户端随即发起下一轮。
+
+所以 **60s 不是配置生效延迟，而是无变更时连接保持的上限**，实际变更生效在秒级。
+
+这也解释了为什么 `poll_timeout` 必须大于 60：客户端读超时短于服务端挂起时长，
+每一轮都会在服务端应答之前被客户端自己掐断。本库在构造函数里直接校验这一点。
+
+部署注意：60s 的挂起请求经过 Nginx / ALB 时容易被判超时返回 504，反向代理的读超时
+需要调到 60s 以上。
+
+## 日志安全
+
+库在**任何日志级别**都不输出配置值，只输出 key 名：
+
+```
+INFO  namespace=application 配置变更: ['FEATURE_FLAG', 'MYSQL_DSN']
+INFO  namespace=application 已冻结 2 个 key（禁止热更新）: ['MYSQL_DSN', 'REDIS_URL']
+WARN  required_keys 未从 Apollo 解析出值，按 allow_fallback=True 继续; missing={'application': ['REDIS_URL']}
+```
+
+`access_key_secret` 同样不会出现在日志里。测试套件里有专门的断言覆盖这一点
+（`tests/test_logging_redaction.py`）。
+
+## ConfigManager
+
+按 namespace 组织回调的薄封装：
+
+```python
+from apollocfg import ConfigManager
+
+manager = ConfigManager(
+    app_id="app",
+    meta_server="http://meta.example.com",
+    namespaces=["application", "database"],
+)
+manager.start()
+
+@manager.on_namespace_change("database")
+def on_db_change(namespace, changes):
+    rebuild_pool()
+
+manager.get_value("KEY", namespace="database")
+```
+
+`get_typed` 可以用任意模型类解析某个 namespace（只要提供 `model_validate(dict)`
+类方法，pydantic v2 天然满足）。库本身不绑定任何模型库：
+
+```python
+cfg = manager.get_typed("database", MyPydanticModel)
+```
+
+## 从环境变量构建
+
+```python
+from apollocfg import create_config_manager_from_env
+
+manager = create_config_manager_from_env()
+```
+
+| 环境变量 | 说明 | 默认 |
+|---|---|---|
+| `APOLLO_APP_ID` | 应用 AppId | **必填** |
+| `APOLLO_META_SERVER` | meta server 地址 | 与下一项二选一 |
+| `APOLLO_CONFIG_URL` | Config Service 地址 | 与上一项二选一 |
+| `APOLLO_CLUSTER` | 集群名 | `default` |
 | `APOLLO_NAMESPACES` | 逗号分隔的 namespace | `application` |
-| `APOLLO_ENV` | 环境名 | 空 |
-| `APOLLO_ACCESS_KEY_SECRET` | 访问密钥（可选） | 空 |
-| `APOLLO_CACHE_DIR` | 本地缓存目录 | `.apollo_cache` |
-| `ORACLE_INSTANT_CLIENT` | Oracle Instant Client 路径（仅 11g 需要） | 空 |
+| `APOLLO_ENV` | 环境名（仅用于日志标识） | 空 |
+| `APOLLO_CLIENT_IP` | 灰度发布用客户端 IP | 空 |
+| `APOLLO_ACCESS_KEY_SECRET` | 访问密钥 | 空（匿名） |
+| `APOLLO_REQUIRED_KEYS` | 逗号分隔，必须来自 Apollo 的 key | 空 |
+| `APOLLO_FROZEN_KEYS` | 逗号分隔，禁止热更新的 key | 空 |
+| `APOLLO_ALLOW_FALLBACK` | 不可达时是否降级 | `true` |
 
-## 示例应用
+空白值视为未设置（容器平台常把未配置的变量注入成空串）。`on_resolved` 是可调用对象，
+只能通过参数传入。
 
-`examples/` 下提供 Flask / FastAPI 两个完整示例（DB 连接池热重建）：
+装了 `python-dotenv` 会自动加载 `.env`：
 
 ```bash
-cd examples
-pip install -r requirements.txt        # 会以 editable 方式安装本库
-cp ../.env.example .env                # 按需修改 Apollo 地址 / AppId
-python flask_app.py                    # http://localhost:5000/config/database
-# 或 python fastapi_app.py
+pip install apollocfg[dotenv]
 ```
 
-## 生产建议
+## 异常
 
-- **脱敏**：`password` / `bind_password` 等建议标记为 Apollo「私密配置」，对外接口务必脱敏（见 `public_dict()`）。
-- **优雅关闭**：进程退出前调用 `config_manager.stop()` 停止长轮询线程（示例在 `settings.py` 用 `atexit` 注册）。
-- **回调要快**：变更回调里只做「置空 / 标记失效」这类轻量操作，真正的重建放到请求路径上惰性执行。
-- **本地缓存目录** `.apollo_cache/` 应加入 `.gitignore`，不要提交到代码库。
+```
+ApolloError
+├── ConfigServiceUnavailable   所有实例不可达（allow_fallback=False 时抛）
+├── RequiredKeysMissing        required_keys 未解析出值，.missing 按 namespace 聚合
+└── StartupAssertionFailed     on_resolved 拒绝了最终配置，.reason 为原因
+```
 
-## Roadmap
+## 构造参数
 
-- [ ] 多 Config Service 端点 / HA 故障转移（当前为单 `config_url`）
-- [ ] 可选的 async wrapper（基于 `httpx` 或线程池），不进核心
-- [ ] 配置变更事件的同步原语（如 `watch()` 返回最新值的上下文管理器）
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `app_id` | 应用 AppId | 必填 |
+| `config_url` / `meta_server` | 地址，至少给一个 | — |
+| `cluster` | 集群 | `default` |
+| `namespaces` | namespace 列表 | `["application"]` |
+| `env` | 环境名标识 | `None` |
+| `client_ip` | 灰度 IP | `None` |
+| `access_key_secret` | 访问密钥 | `None` |
+| `required_keys` | 必需 key | `None` |
+| `frozen_keys` | 冻结 key | `None` |
+| `allow_fallback` | 允许降级 | `True` |
+| `on_resolved` | 启动断言 | `None` |
+| `poll_timeout` | 长轮询读超时，必须 > 60 | `90` |
+| `request_timeout` | 普通请求超时 | `5` |
+| `poll_interval` | 异常后首次重试间隔 | `2.0` |
+| `max_retry_backoff` | 退避上限 | `30.0` |
+
+## 测试
+
+```bash
+pip install -e ".[test]"
+pytest                    # 单元测试，全部走 requests_mock，不碰网络
+```
+
+端到端测试默认跳过，需要真实 Apollo 实例：
+
+```bash
+APOLLOCFG_E2E=1 \
+APOLLOCFG_E2E_META_SERVER=http://your-apollo-meta.example.com \
+APOLLOCFG_E2E_APP_ID=your-app-id \
+pytest tests/test_e2e.py -v -m e2e
+```
+
+E2E 只读，不修改 Apollo 上的配置。其中一条会真实等待服务端 60s 挂起以验证长轮询语义，
+整套耗时约 2.5 分钟。
+
+## 致谢
+
+本项目基于 [apollo-config-client](https://github.com/Jiafan/apollo-config-client)
+（MIT, © Jiafan）改造，保留了其长轮询与签名实现的核心思路。服务发现与实例轮换的设计
+参考了 [OuterCloud/pyapollo](https://github.com/OuterCloud/pyapollo)。
+
+相对上游的主要变化：移除本地磁盘缓存（改为纯内存）与 Oracle/LDAP 领域模型，
+新增 `required_keys` / `frozen_keys` / `on_resolved` 契约语义、meta server 服务发现、
+`poll_timeout` 校验与日志脱敏。
 
 ## License
 
-[MIT](LICENSE)
+MIT

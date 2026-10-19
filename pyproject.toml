@@ -3,14 +3,22 @@ requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "apollo-config-client"
+name = "apollocfg"
 dynamic = ["version"]
-description = "A lightweight, synchronous Apollo config-center client: long-polling hot reload, local cache failover, and access-key HMAC signing. Only depends on requests."
+description = "A lightweight, synchronous Apollo config-center client: long-polling hot reload, meta-server discovery, key contracts (required/frozen), and access-key HMAC signing. Only depends on requests."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-authors = [{ name = "Jiafan" }]
-keywords = ["apollo", "config", "configuration", "hot-reload", "long-polling"]
+authors = [{ name = "fgd-haha" }]
+keywords = [
+    "apollo",
+    "apollo-config",
+    "config",
+    "configuration",
+    "config-center",
+    "hot-reload",
+    "long-polling",
+]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -26,23 +34,20 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Jiafan/apollo-config-client"
-Repository = "https://github.com/Jiafan/apollo-config-client"
-Documentation = "https://github.com/Jiafan/apollo-config-client#readme"
+Homepage = "https://github.com/fgd-haha/apollocfg"
+Repository = "https://github.com/fgd-haha/apollocfg"
+Documentation = "https://github.com/fgd-haha/apollocfg#readme"
 
 [project.optional-dependencies]
-models = ["pydantic>=2.5.0"]
-oracle = ["oracledb>=2.0.0"]
 dotenv = ["python-dotenv>=1.0.0"]
-all = ["pydantic>=2.5.0", "oracledb>=2.0.0", "python-dotenv>=1.0.0"]
-test = ["pytest>=8.0.0", "requests-mock>=1.11.0"]
+test = ["pytest>=8.0.0", "requests-mock>=1.11.0", "python-dotenv>=1.0.0"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["apollo_config"]
+packages = ["apollocfg"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "apollo_config",
+    "apollocfg",
     "tests",
     "README.md",
     "LICENSE",
@@ -51,6 +56,34 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "e2e: 需要真实 Apollo 实例的端到端测试（默认跳过，设 APOLLOCFG_E2E=1 开启）",
+]
+
+[tool.ruff]
+# 支持的最低 Python 版本。决定 ruff 是否建议 3.10+ 的类型写法（dict / X | None）：
+# 本包声明 requires-python = ">=3.9"，所以保留 typing.Dict / Optional 的写法。
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF", "BLE", "C4", "SIM"]
+ignore = [
+    # UP006/UP045/UP035: 要求 dict / X | None / collections.abc，均为 3.10+ 语法。
+    # 本包要支持 3.9，运行时 isinstance 也用到 typing 之外的 Mapping，故保留现写法。
+    "UP006",
+    "UP045",
+    "UP035",
+    # RUF001-003: 把中文全角标点报成"歧义 Unicode 字符"。本项目文档与注释为中文，
+    # 全角标点是正确写法，不是笔误。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里需要故意触发异常、构造异常分支
+"tests/*" = ["BLE001", "B017", "SIM117"]
 
 [tool.hatch.version]
 source = "vcs"
