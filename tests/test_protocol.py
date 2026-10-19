@@ -351,3 +351,133 @@ def test_frozen_snapshot_not_captured_on_hard_startup_failure(client_kwargs):
     assert client.get_value("DSN") == "mysql://recovered", (
         "启动失败后重试成功，应拿到真实的冻结值而不是固化的哨兵值"
     )
+
+
+@pytest.mark.parametrize(
+    ("notify_kwargs", "label"),
+    [
+        ({"json": [{"namespaceName": "application", "notificationId": 7}]}, "id 与本地相同"),
+        ({"json": []}, "空通知数组"),
+        ({"status_code": 304}, "304 秒回"),
+    ],
+)
+def test_immediate_server_response_does_not_busy_loop(
+    client_kwargs, notify_kwargs, label
+):
+    """服务端秒回且无更新时，必须按 poll_interval 节流。
+
+    正常 Apollo 会把长轮询挂起约 60s，但代理故障或配置异常时可能立刻返回。
+    此时若立刻续下一轮，就是无间隔忙循环——修复前实测 800+ 次/0.6 秒。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        notify = m.get(NOTIFY_PATH, **notify_kwargs)
+        kwargs = dict(client_kwargs)
+        kwargs["poll_interval"] = 0.2
+        client = ApolloClient(**kwargs)
+        client.start()
+        client._notification_ids["application"] = 7
+        before = notify.call_count
+        time.sleep(0.6)
+        calls = notify.call_count - before
+        client.stop()
+
+    assert calls <= 8, f"{label}: 0.6 秒内发了 {calls} 次长轮询，疑似忙循环"
+
+
+def test_falsy_notifications_json_is_protocol_error(client_kwargs):
+    """200 {} 不能被吞成"无变更"——那会掩盖协议问题。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        m.get(NOTIFY_PATH, json={})
+        client = ApolloClient(**client_kwargs)
+        client.start()
+        with pytest.raises(ApolloProtocolError, match="数组"):
+            client._poll_once()
+        client.stop()
+
+
+def test_null_config_value_is_protocol_error(client_kwargs):
+    """配置值为 null 要报错，不能 str() 成字符串 "None"。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json={"configurations": {"K": None}, "releaseKey": "rk"})
+        client = ApolloClient(**client_kwargs)
+        with pytest.raises(ApolloProtocolError, match="值类型非法"):
+            client._fetch_namespace("application", initial=True)
+
+
+def test_frozen_snapshot_rolled_back_on_contract_failure(client_kwargs):
+    """契约校验失败时要回滚冻结快照，否则重试永远无法自愈。
+
+    调用方可能在 Apollo 侧补齐配置后复用同一客户端重试 start()。若失败启动
+    期间建的快照留下，_capture_frozen 会因"已 captured"跳过，Apollo 新补的
+    冻结值永远不可见，required_keys 也永远判定缺失。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(
+            CONFIGS_PATH,
+            [
+                {"json": config_payload({"OTHER": "1"}, "rk1")},
+                {"json": config_payload({"OTHER": "1", "DSN": "mysql://real"}, "rk2")},
+            ],
+        )
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            frozen_keys=["DSN"],
+            required_keys=["DSN"],
+            require_resolved_keys=True,
+            **client_kwargs,
+        )
+        from apollocfg.errors import RequiredKeysMissing
+
+        with pytest.raises(RequiredKeysMissing):
+            client.start()
+
+        # Apollo 补上了这个 key，重试应当成功并拿到真实值
+        client.start()
+        client.stop()
+
+    assert client.get_value("DSN") == "mysql://real"
+
+
+def test_callback_inner_dict_is_copied(client_kwargs):
+    """内层 {"old":..,"new":..} 也要复制，否则前一个回调能改到后一个。"""
+    observed = []
+
+    def mutating(namespace, changes):
+        changes["K"]["new"] = "TAMPERED"
+
+    def observer(namespace, changes):
+        observed.append(changes["K"]["new"])
+
+    with requests_mock.Mocker() as m:
+        m.get(
+            CONFIGS_PATH,
+            [
+                {"json": config_payload({"K": "V1"}, "rk1")},
+                {"json": config_payload({"K": "V2"}, "rk2")},
+            ],
+        )
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(**client_kwargs)
+        client.register_callback(mutating)
+        client.register_callback(observer)
+        client.start()
+        client._fetch_namespace("application")
+        client.stop()
+
+    assert observed == ["V2"], "后一个回调不应看到前一个回调的改动"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"not": "a list"}, "a string", 42, [{"homepageUrl": None}], ["not-a-dict"]],
+)
+def test_malformed_meta_server_response_returns_empty(payload):
+    """meta server 响应畸形时返回空列表，不抛未捕获的类型错误。"""
+    from tests.conftest import META_URL
+
+    with requests_mock.Mocker() as m:
+        m.get(f"{META_URL}/services/config", json=payload)
+        client = ApolloClient(app_id="unit-app", meta_server=META_URL, poll_timeout=61)
+        assert client._discover_services() == []
