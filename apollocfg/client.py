@@ -184,8 +184,15 @@ class ApolloClient:
         想要合并后的结果用 :meth:`effective_configs`。
         """
         with self._lock:
-            merged = dict(self._configs.get(namespace, {}))
-            merged.update(self._frozen_snapshot.get(namespace, {}))
+            declared_frozen = self.frozen_keys.get(namespace, set())
+            snapshot = self._frozen_snapshot.get(namespace, {})
+            merged = {
+                key: value
+                for key, value in self._configs.get(namespace, {}).items()
+                # 声明冻结但启动时无值的 key：保持"无值"。见 _frozen_snapshot 的说明。
+                if key not in declared_frozen
+            }
+            merged.update(snapshot)
             return merged
 
     def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
@@ -193,12 +200,17 @@ class ApolloClient:
 
         这是 ``required_keys`` 判定和 ``on_resolved`` 断言所依据的视图——只看
         Apollo 的值会把"回退到静态配置"误判成"什么都没有"。
+
+        冻结快照最后套用，确保声明冻结的 key 在这个视图里也不会被运行期的
+        Apollo 值顶掉。
         """
         merged = dict(self.static_fallback.get(namespace, {}))
         for key, value in self.get_configs(namespace).items():
             # Apollo 下发空白值不应覆盖掉调用方的有效兜底值
             if (value or "").strip() or key not in merged:
                 merged[key] = value
+        with self._lock:
+            merged.update(self._frozen_snapshot.get(namespace, {}))
         return merged
 
     def get_value(
@@ -207,11 +219,18 @@ class ApolloClient:
         default: Optional[str] = None,
         namespace: str = DEFAULT_NAMESPACE,
     ) -> Optional[str]:
-        """读取单个 key。``frozen_keys`` 返回启动时的快照值。"""
+        """读取单个 key。``frozen_keys`` 返回启动时的快照值。
+
+        被声明冻结但启动时无值的 key 始终返回 ``default``——哪怕 Apollo 后来
+        发布了它。冻结语义是"这个 key 的可见值在进程生命周期内不变"，让它中途
+        冒出一个值同样会造成"配置显示有值、而资源是按无值建的"的不一致。
+        """
         with self._lock:
             frozen = self._frozen_snapshot.get(namespace, {})
             if key in frozen:
                 return frozen[key]
+            if key in self.frozen_keys.get(namespace, set()):
+                return default
             return self._configs.get(namespace, {}).get(key, default)
 
     @property
@@ -228,8 +247,9 @@ class ApolloClient:
         """同步拉取一次全量配置，校验契约，然后启动后台长轮询线程。
 
         Raises:
+            ApolloProtocolError: 响应不符合 Apollo 协议，且 ``allow_fallback=False``。
             ConfigServiceUnavailable: 所有实例不可达且 ``allow_fallback=False``。
-            RequiredKeysMissing: ``required_keys`` 未解析出值且 ``allow_fallback=False``。
+            RequiredKeysMissing: ``required_keys`` 未解析出值（见 ``require_resolved_keys``）。
             StartupAssertionFailed: ``on_resolved`` 拒绝了最终配置。
         """
         if self._started:
@@ -246,9 +266,16 @@ class ApolloClient:
             # 所有 namespace 都失败，视为 Config Service 整体不可用
             attempted = self._attempted_hosts()
             if not self.allow_fallback:
+                # 协议错误原样抛出，保留"是代理在干预"这个信息——把它压成
+                # ConfigServiceUnavailable 会让调用方以为是网络不可达。
+                protocol_errors = [
+                    exc for exc in failures.values() if isinstance(exc, ApolloProtocolError)
+                ]
+                if len(protocol_errors) == len(failures):
+                    raise protocol_errors[0]
                 raise ConfigServiceUnavailable(
                     f"all namespaces failed to load: {sorted(failures)}", attempted
-                )
+                ) from next(iter(failures.values()))
             logger.warning(
                 "Apollo 不可达，按 allow_fallback=True 降级，调用方静态配置生效; "
                 "namespaces=%s tried=%s",
@@ -473,12 +500,19 @@ class ApolloClient:
             self._release_keys[namespace] = new_release
 
             if initial:
-                # 启动时为 frozen_keys 建快照：此后这些 key 的返回值固定不变
-                frozen = {
-                    k: new_configs[k]
-                    for k in self.frozen_keys.get(namespace, set())
-                    if k in new_configs
-                }
+                # 启动时为 frozen_keys 建快照：此后这些 key 的返回值固定不变。
+                #
+                # 快照取的是「最终生效值」——Apollo 有值用 Apollo 的，否则用
+                # 调用方的静态兜底。只看 Apollo 会漏掉"启动时只在静态配置里"
+                # 的 key，等 Apollo 后来发布它时，这个本该冻结的值就变了，
+                # 而应用的连接池还是用启动时那个值建的。
+                static = self.static_fallback.get(namespace, {})
+                frozen = {}
+                for key in self.frozen_keys.get(namespace, set()):
+                    if (new_configs.get(key) or "").strip():
+                        frozen[key] = new_configs[key]
+                    elif key in static:
+                        frozen[key] = static[key]
                 self._frozen_snapshot[namespace] = frozen
                 if frozen:
                     logger.info(
@@ -488,8 +522,12 @@ class ApolloClient:
                         sorted(frozen),
                     )
 
-            # frozen_keys 对调用方不可见地变化，不该出现在回调里
-            frozen_names = set(self._frozen_snapshot.get(namespace, {}))
+            # frozen_keys 对调用方不可见地变化，不该出现在回调里。
+            #
+            # 用「声明的」冻结 key 集合而不是快照里实际有值的那些：某个 key
+            # 启动时两边都没有、后来 Apollo 才发布，它仍然是被声明冻结的，
+            # 不该因为快照里没有就放它进回调。
+            frozen_names = set(self.frozen_keys.get(namespace, set()))
 
         changes = {k: v for k, v in raw_changes.items() if k not in frozen_names}
         suppressed = sorted(set(raw_changes) & frozen_names)
@@ -507,16 +545,23 @@ class ApolloClient:
         return changes
 
     def _request_with_failover(self, namespace: str) -> requests.Response:
-        """拉取配置，连接失败时依次尝试服务池里所有未试过的实例。
+        """拉取配置，失败时依次尝试服务池里所有未试过的实例。
 
         只重试一次是不够的：三个实例、前两个都挂的情况下，单次轮换仍会失败，
         而服务发现的意义正是"有健康实例就该找到它"。
 
-        注意只对连接层异常做 failover。HTTP 状态码不在这里判断——4xx 通常是
-        appId/namespace 配错或验签失败，换实例也是一样的结果，重试只会放大错误。
+        哪些失败该换实例：
+
+          - 连接层异常（超时 / 连接被拒）—— 换。这个实例或链路有问题。
+          - **5xx** —— 换。实例过载或内部错误，别的实例可能是健康的；代理层
+            过载时返回的空 body 502/504 也落在这里。
+          - 4xx —— **不换**。appId / namespace 配错、验签失败都是 4xx，换实例
+            结果一样，重试只会放大错误（也会多打几份无效请求）。
+
+        全部实例都失败时抛出最后一次的异常，交给调用方按降级策略处置。
         """
         attempted: List[str] = []
-        last_exc: Optional[requests.RequestException] = None
+        last_error: Optional[BaseException] = None
 
         while True:
             base = self._ensure_config_url()
@@ -524,19 +569,31 @@ class ApolloClient:
                 # 已经绕回试过的实例，说明池里的都试完了
                 break
             attempted.append(base)
-            try:
-                return self._request_namespace(base, namespace)
-            except requests.RequestException as exc:
-                last_exc = exc
-                logger.warning("namespace=%s 从 %s 拉取失败: %s", namespace, base, exc)
-                if not self._rotate_config_url():
-                    break
-                # 轮换后若池里已无未试过的实例，不必再绕一圈
-                if all(host in attempted for host in self._known_hosts()):
-                    break
 
-        assert last_exc is not None  # 循环至少执行一次，要么 return 要么置 last_exc
-        raise last_exc
+            try:
+                resp = self._request_namespace(base, namespace)
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.warning("namespace=%s 从 %s 拉取失败: %s", namespace, base, exc)
+            else:
+                if resp.status_code < 500:
+                    # 含 2xx / 304 / 4xx，交给调用方判断（4xx 由 raise_for_status 抛）
+                    return resp
+                last_error = requests.HTTPError(
+                    f"{resp.status_code} from {base}", response=resp
+                )
+                logger.warning(
+                    "namespace=%s 从 %s 拉取得到 HTTP %s", namespace, base, resp.status_code
+                )
+
+            if not self._rotate_config_url():
+                break
+            # 轮换后若池里已无未试过的实例，不必再绕一圈
+            if all(host in attempted for host in self._known_hosts()):
+                break
+
+        assert last_error is not None  # 循环至少执行一次，要么 return 要么置 last_error
+        raise last_error
 
     def _known_hosts(self) -> List[str]:
         with self._addr_lock:

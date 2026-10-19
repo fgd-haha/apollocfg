@@ -161,3 +161,74 @@ def test_failover_does_not_retry_on_http_status(client_kwargs):
         total = sum(c.call_count for c in counters.values())
 
     assert total == 1, f"404 不该触发实例轮换，实际请求了 {total} 次"
+
+
+def test_5xx_triggers_failover_to_healthy_instance():
+    """5xx 应当换实例——该实例过载，别的可能是健康的。
+
+    与 4xx 的区别：4xx 是配置或验签问题，换实例结果一样。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(SERVICES_PATH, json=services_payload(["http://bad", "http://good"]))
+        m.get(
+            "http://bad/configs/unit-app/default/application",
+            status_code=503,
+            text="overloaded",
+        )
+        m.get(
+            "http://good/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        for host in ("bad", "good"):
+            m.get(f"http://{host}/notifications/v2", status_code=304)
+
+        for _ in range(10):
+            client = ApolloClient(
+                app_id="unit-app",
+                meta_server=META_URL,
+                allow_fallback=False,
+                poll_timeout=61,
+                request_timeout=1,
+                poll_interval=0.01,
+            )
+            client.start()
+            assert client.get_value("K") == "V"
+            client.stop()
+
+
+def test_empty_body_502_triggers_failover():
+    """代理过载返回的空 body 502 也应换实例。"""
+    with requests_mock.Mocker() as m:
+        m.get(SERVICES_PATH, json=services_payload(["http://bad", "http://good"]))
+        m.get("http://bad/configs/unit-app/default/application", status_code=502, text="")
+        m.get(
+            "http://good/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        for host in ("bad", "good"):
+            m.get(f"http://{host}/notifications/v2", status_code=304)
+
+        for _ in range(8):
+            client = ApolloClient(
+                app_id="unit-app",
+                meta_server=META_URL,
+                allow_fallback=False,
+                poll_timeout=61,
+                request_timeout=1,
+                poll_interval=0.01,
+            )
+            client.start()
+            assert client.get_value("K") == "V"
+            client.stop()
+
+
+def test_protocol_error_propagates_through_start(client_kwargs):
+    """协议错误应当原样穿过 start()，而不是被压成 ConfigServiceUnavailable。
+
+    两者语义不同：前者说明中间有代理在干预，后者说明网络不可达。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, status_code=200, text="")
+        client = ApolloClient(allow_fallback=False, **client_kwargs)
+        with pytest.raises(ApolloProtocolError):
+            client.start()

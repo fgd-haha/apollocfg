@@ -14,7 +14,7 @@ from apollocfg.errors import (
     RequiredKeysMissing,
     StartupAssertionFailed,
 )
-from tests.conftest import CONFIG_URL, config_payload
+from tests.conftest import CONFIG_URL, RecordingCallback, config_payload
 
 CONFIGS_PATH = f"{CONFIG_URL}/configs/unit-app/default/application"
 NOTIFY_PATH = f"{CONFIG_URL}/notifications/v2"
@@ -120,7 +120,6 @@ def test_frozen_key_keeps_startup_snapshot(client_kwargs):
 
 def test_frozen_key_excluded_from_callback(client_kwargs):
     """冻结的 key 变更不应出现在回调里——调用方不会也不该响应它。"""
-    from tests.conftest import RecordingCallback
 
     callback = RecordingCallback()
     with requests_mock.Mocker() as m:
@@ -142,12 +141,15 @@ def test_frozen_key_excluded_from_callback(client_kwargs):
     assert "DSN" not in callback.changed_keys
 
 
-def test_frozen_key_absent_at_startup_is_not_frozen(client_kwargs):
-    """启动时 Apollo 里没有这个 key，就没有快照可冻结，后续出现即可见。
+def test_frozen_key_absent_at_startup_stays_absent(client_kwargs):
+    """启动时无值的冻结 key，后续 Apollo 发布了也不可见。
 
-    这是有意的：冻结语义是"锁住启动时拿到的值"，没拿到就没有值可锁。
-    required_keys 才是用来保证"必须拿到"的那一层。
+    冻结语义是"这个 key 的可见值在进程生命周期内不变"。让它中途冒出一个值，
+    会造成和"值变了"同样的不一致：配置显示有值，而资源是按无值建起来的。
+
+    想保证"必须拿到值"用 required_keys，那是另一层。
     """
+    callback = RecordingCallback()
     with requests_mock.Mocker() as m:
         m.get(
             CONFIGS_PATH,
@@ -158,12 +160,49 @@ def test_frozen_key_absent_at_startup_is_not_frozen(client_kwargs):
         )
         m.get(NOTIFY_PATH, status_code=304)
         client = ApolloClient(frozen_keys=["DSN"], **client_kwargs)
+        client.register_callback(callback)
         client.start()
         assert client.get_value("DSN") is None
         client._fetch_namespace("application")
         client.stop()
 
-    assert client.get_value("DSN") == "appeared"
+    assert client.get_value("DSN") is None, "冻结 key 不应中途出现"
+    assert "DSN" not in client.get_configs("application")
+    assert "DSN" not in callback.changed_keys, "也不该触发回调"
+
+
+def test_frozen_key_falls_back_to_static_at_startup(client_kwargs):
+    """Apollo 启动时没给，但静态兜底里有 —— 冻结快照应锁住静态值。
+
+    否则 Apollo 后来发布这个 key 时，本该冻结的值就变了，而应用的连接池
+    是按启动时的静态值建的。
+    """
+    callback = RecordingCallback()
+    with requests_mock.Mocker() as m:
+        m.get(
+            CONFIGS_PATH,
+            [
+                {"json": config_payload({"OTHER": "1"}, "rk1")},
+                {"json": config_payload({"OTHER": "1", "DSN": "from-apollo"}, "rk2")},
+            ],
+        )
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            frozen_keys=["DSN"],
+            static_fallback={"application": {"DSN": "from-static"}},
+            **client_kwargs,
+        )
+        client.register_callback(callback)
+        client.start()
+        assert client.effective_configs("application")["DSN"] == "from-static"
+
+        client._fetch_namespace("application")
+        client.stop()
+
+    assert client.effective_configs("application")["DSN"] == "from-static", (
+        "冻结快照应锁住启动时的静态兜底值"
+    )
+    assert "DSN" not in callback.changed_keys
 
 
 def test_get_configs_applies_frozen_snapshot(client_kwargs):
