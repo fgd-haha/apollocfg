@@ -159,7 +159,14 @@ class ApolloClient:
         self._addr_lock = threading.RLock()
         self._configs: Dict[str, Dict[str, str]] = {}
         self._release_keys: Dict[str, str] = {}
+        # 冻结快照分两份，避免 static_fallback 泄漏进只应反映 Apollo 的视图：
+        #   _frozen_snapshot          -> 启动时 Apollo 侧的冻结值，供 get_configs/get_value
+        #   _frozen_effective         -> 启动时最终生效的冻结值（含静态兜底），供 effective_configs
         self._frozen_snapshot: Dict[str, Dict[str, str]] = {ns: {} for ns in self.namespaces}
+        self._frozen_effective: Dict[str, Dict[str, str]] = {ns: {} for ns in self.namespaces}
+        # 哪些 namespace 已经建过冻结快照。start/stop/start 时不能重建，
+        # 否则冻结值会从旧值跳到新值，违反"进程生命周期内不变"。
+        self._frozen_captured: set = set()
         self._notification_ids: Dict[str, int] = dict.fromkeys(self.namespaces, -1)
 
         self._callbacks: List[ChangeCallback] = []
@@ -210,7 +217,12 @@ class ApolloClient:
             if (value or "").strip() or key not in merged:
                 merged[key] = value
         with self._lock:
-            merged.update(self._frozen_snapshot.get(namespace, {}))
+            declared_frozen = self.frozen_keys.get(namespace, set())
+            effective_frozen = self._frozen_effective.get(namespace, {})
+            # 声明冻结但启动时两边都无值的 key：保持无值
+            for key in declared_frozen - set(effective_frozen):
+                merged.pop(key, None)
+            merged.update(effective_frozen)
         return merged
 
     def get_value(
@@ -417,14 +429,22 @@ class ApolloClient:
     def _rotate_config_url(self) -> bool:
         """当前实例失败后轮换到下一个。返回是否换到了新地址。
 
-        只在配置了 meta_server 时有效——没有实例列表就无处可换，此时返回 False
-        让调用方把原始异常抛出去，而不是静默重试同一个地址。
+        池里没有其他候选时会**重新查一次 meta server**：滚动发布会把整批实例
+        换掉，若只认启动时发现的那批地址，长跑进程会永久钉在已下线的实例上，
+        热更新静默失效直到进程重启。
+
+        没有配置 meta_server 时无处可换，返回 False 让调用方抛出原始异常，
+        而不是静默重试同一个地址。
         """
         with self._addr_lock:
             failed = self._config_url
-            if not self._service_pool:
-                self._service_pool = self._discover_services()
             candidates = [h for h in self._service_pool if h != failed]
+            if not candidates and self.meta_server:
+                # 池耗尽，重新发现。可能拿到一批全新的实例地址。
+                discovered = self._discover_services()
+                candidates = [h for h in discovered if h != failed]
+                if discovered:
+                    self._service_pool = discovered
             if not candidates:
                 return False
             self._config_url = candidates[0]
@@ -499,27 +519,35 @@ class ApolloClient:
             self._configs[namespace] = new_configs
             self._release_keys[namespace] = new_release
 
-            if initial:
+            if initial and namespace not in self._frozen_captured:
                 # 启动时为 frozen_keys 建快照：此后这些 key 的返回值固定不变。
+                # 只建一次——start/stop/start 不重建，否则冻结值会跳变。
                 #
-                # 快照取的是「最终生效值」——Apollo 有值用 Apollo 的，否则用
-                # 调用方的静态兜底。只看 Apollo 会漏掉"启动时只在静态配置里"
-                # 的 key，等 Apollo 后来发布它时，这个本该冻结的值就变了，
-                # 而应用的连接池还是用启动时那个值建的。
+                # 两份快照：Apollo 侧的值进 _frozen_snapshot（供 get_configs），
+                # 最终生效值（Apollo 无值时回落静态兜底）进 _frozen_effective
+                # （供 effective_configs）。分开存是为了不让 static_fallback
+                # 泄漏进"只反映 Apollo"的视图。
                 static = self.static_fallback.get(namespace, {})
-                frozen = {}
-                for key in self.frozen_keys.get(namespace, set()):
-                    if (new_configs.get(key) or "").strip():
-                        frozen[key] = new_configs[key]
-                    elif key in static:
-                        frozen[key] = static[key]
-                self._frozen_snapshot[namespace] = frozen
-                if frozen:
+                declared = self.frozen_keys.get(namespace, set())
+                apollo_frozen = {
+                    key: new_configs[key]
+                    for key in declared
+                    if (new_configs.get(key) or "").strip()
+                }
+                effective_frozen = dict(apollo_frozen)
+                for key in declared:
+                    if key not in effective_frozen and key in static:
+                        effective_frozen[key] = static[key]
+
+                self._frozen_snapshot[namespace] = apollo_frozen
+                self._frozen_effective[namespace] = effective_frozen
+                self._frozen_captured.add(namespace)
+                if declared:
                     logger.info(
-                        "namespace=%s 已冻结 %d 个 key（禁止热更新）: %s",
+                        "namespace=%s 已冻结 %d 个声明 key（禁止热更新），其中 %d 个有值",
                         namespace,
-                        len(frozen),
-                        sorted(frozen),
+                        len(declared),
+                        len(effective_frozen),
                     )
 
             # frozen_keys 对调用方不可见地变化，不该出现在回调里。

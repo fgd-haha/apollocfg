@@ -133,3 +133,111 @@ def test_explicit_config_url_skips_discovery():
 
     assert client.config_url == HOST_A
     assert services.call_count == 0, "config_url 已给出时不应触发服务发现"
+
+
+def test_pool_refreshed_when_exhausted():
+    """池里的实例全部下线后，应重新查 meta server 发现新实例。
+
+    滚动发布会把整批实例换掉。只认启动时发现的地址会让长跑进程永久钉在
+    已下线的实例上，热更新静默失效直到进程重启。
+    """
+    with requests_mock.Mocker() as m:
+        # 第一次发现只有 old；第二次（池耗尽后）返回换代后的 new
+        m.get(
+            SERVICES_PATH,
+            [
+                {"json": services_payload(["http://old"])},
+                {"json": services_payload(["http://new"])},
+            ],
+        )
+        m.get(
+            "http://old/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        m.get("http://old/notifications/v2", status_code=304)
+        m.get(
+            "http://new/configs/unit-app/default/application",
+            json=config_payload({"K": "V2"}, "rk2"),
+        )
+        m.get("http://new/notifications/v2", status_code=304)
+
+        client = ApolloClient(
+            app_id="unit-app", meta_server=META_URL, poll_timeout=61, poll_interval=0.01
+        )
+        client.start()
+        assert client.config_url == "http://old"
+
+        # old 下线，池里没有其他候选 -> 应重新发现并换到 new
+        assert client._rotate_config_url() is True
+        assert client.config_url == "http://new"
+        client.stop()
+
+
+def test_rotation_returns_false_without_meta_server():
+    """没有 meta server 时池耗尽也无处可换。"""
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            json=config_payload({"K": "V"}),
+        )
+        m.get(_notify_path(HOST_A), status_code=304)
+        client = ApolloClient(
+            app_id="unit-app", config_url=HOST_A, poll_timeout=61, poll_interval=0.01
+        )
+        assert client._rotate_config_url() is False
+        assert client.config_url == HOST_A
+
+
+def test_frozen_snapshot_not_rebuilt_on_restart():
+    """start/stop/start 不应重建冻结快照——冻结值必须跨重启保持。"""
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            [
+                {"json": config_payload({"DSN": "v1"}, "rk1")},
+                {"json": config_payload({"DSN": "v2"}, "rk2")},
+            ],
+        )
+        m.get(_notify_path(HOST_A), status_code=304)
+        client = ApolloClient(
+            app_id="unit-app",
+            config_url=HOST_A,
+            frozen_keys=["DSN"],
+            poll_timeout=61,
+            poll_interval=0.01,
+        )
+        client.start()
+        first = client.get_value("DSN")
+        client.stop()
+
+        client.start()
+        second = client.get_value("DSN")
+        client.stop()
+
+    assert first == "v1"
+    assert second == "v1", "第二次 start 不应把冻结值换成 Apollo 的新值"
+
+
+def test_static_fallback_does_not_leak_into_get_configs():
+    """get_configs 只反映 Apollo 侧，static_fallback 不能从冻结快照漏进来。"""
+    with requests_mock.Mocker() as m:
+        m.get(
+            f"{HOST_A}/configs/unit-app/default/application",
+            json=config_payload({"OTHER": "1"}),
+        )
+        m.get(_notify_path(HOST_A), status_code=304)
+        client = ApolloClient(
+            app_id="unit-app",
+            config_url=HOST_A,
+            frozen_keys=["DSN"],
+            static_fallback={"application": {"DSN": "from-static"}},
+            poll_timeout=61,
+            poll_interval=0.01,
+        )
+        client.start()
+        client.stop()
+
+    assert client.get_configs("application") == {"OTHER": "1"}
+    assert client.get_value("DSN") is None
+    # 但 effective 视图里应当有静态兜底值
+    assert client.effective_configs("application")["DSN"] == "from-static"
