@@ -287,8 +287,33 @@ def test_unsubscribed_namespace_notification_is_ignored(client_kwargs):
         )
         client = ApolloClient(**client_kwargs)
         client.start()
-        assert client._poll_once() == []
+        # 返回 None（按"无变更"处理），而不是空列表
+        assert client._poll_once() is None
         client.stop()
+
+
+def test_persistent_unsubscribed_notifications_do_not_busy_loop(client_kwargs):
+    """服务端一直只返回未订阅 namespace 时，不能打成高频忙循环。
+
+    我们的请求不带这些 namespace，它们的 id 无从推进，服务端可能一直返回
+    同一份响应。若按"成功且无变更"立刻续下一轮，就是无间隔忙循环。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        notify = m.get(
+            NOTIFY_PATH,
+            json=[{"namespaceName": "someone-else", "notificationId": 3}],
+        )
+        kwargs = dict(client_kwargs)
+        kwargs["poll_interval"] = 0.2
+        client = ApolloClient(**kwargs)
+        client.start()
+        time.sleep(1.0)
+        calls = notify.call_count
+        client.stop()
+
+    # 1 秒 / 0.2 秒间隔 -> 个位数请求。没有退避的话会是几百上千次。
+    assert calls <= 12, f"疑似忙循环：1 秒内发了 {calls} 次长轮询请求"
 
 
 def test_frozen_snapshot_not_captured_on_hard_startup_failure(client_kwargs):

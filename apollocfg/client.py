@@ -863,6 +863,7 @@ class ApolloClient:
 
         updated: List[str] = []
         failed: List[str] = []
+        ignored: List[str] = []
         for item in items:
             # 畸形通知项抛协议错误而不是静默跳过：若服务端持续返回同样的畸形
             # 响应，静默跳过会让 _poll_once 返回空列表、被当成成功，于是没有
@@ -880,8 +881,10 @@ class ApolloClient:
                     f"namespace={ns} 的 notificationId 应为整数"
                 )
             if ns not in self._notification_ids:
-                # 服务端返回了我们没订阅的 namespace，忽略即可（不是协议错误）
+                # 服务端返回了我们没订阅的 namespace。不是协议错误，忽略即可，
+                # 但要记下来——若整轮通知全被忽略，调用方需要据此退避。
                 logger.warning("收到未订阅 namespace 的通知: %s", ns)
+                ignored.append(ns)
                 continue
             # 用"不相等"而不是"更大"：Config Service 重启或轮换到别的实例后，
             # 服务端的 notificationId 可能比客户端持有的更小。要求单调递增会
@@ -906,4 +909,11 @@ class ApolloClient:
                 f"notification fetch failed for: {sorted(failed)}",
                 self._attempted_hosts(),
             )
+        if ignored and not updated:
+            # 整轮通知全部来自未订阅的 namespace。我们的请求不带这些 namespace，
+            # 它们的 id 也无从推进，服务端可能一直返回同一份响应。返回 None 让
+            # 调用方按"无变更"处理 —— 调用方会立刻续下一轮，所以这里要自己等
+            # 一个 poll_interval，避免打成忙循环。
+            self._stop_event.wait(self.poll_interval)
+            return None
         return updated
