@@ -300,15 +300,14 @@ class ApolloClient:
             except Exception as exc:  # noqa: BLE001 - 汇总后按策略统一处理
                 failures[ns] = exc
 
-        # 拉取失败的 namespace 也要建冻结快照，否则 effective_configs 会把
-        # "声明冻结但未捕获"的 key 当成无值删掉——于是静态兜底值消失，
-        # 哨兵断言拿不到哨兵值反而放行，正是要防的那个故障。
-        self._capture_pending_frozen()
-
         if failures and len(failures) == len(self.namespaces):
             # 所有 namespace 都失败，视为 Config Service 整体不可用
             attempted = self._attempted_hosts()
             if not self.allow_fallback:
+                # 注意：在这条路径上**不能**补建冻结快照。调用方可能在 Apollo
+                # 恢复后复用同一个客户端重试 start()，若此刻已把 namespace 标记
+                # 为 captured，重试成功后新拉到的冻结值将永远不可见。
+                #
                 # 协议错误原样抛出，保留"是代理在干预"这个信息——把它压成
                 # ConfigServiceUnavailable 会让调用方以为是网络不可达。
                 protocol_errors = [
@@ -327,6 +326,11 @@ class ApolloClient:
             )
         elif failures:
             logger.warning("部分 namespace 拉取失败: %s", sorted(failures))
+
+        # 启动确定会继续，才为拉取失败的 namespace 补建冻结快照。否则
+        # effective_configs 会把"声明冻结但未捕获"的 key 当成无值删掉——
+        # 静态兜底值消失，哨兵断言拿不到哨兵值反而放行。
+        self._capture_pending_frozen()
 
         self._check_required_keys()
         self._run_startup_assertion()
@@ -860,11 +864,24 @@ class ApolloClient:
         updated: List[str] = []
         failed: List[str] = []
         for item in items:
+            # 畸形通知项抛协议错误而不是静默跳过：若服务端持续返回同样的畸形
+            # 响应，静默跳过会让 _poll_once 返回空列表、被当成成功，于是没有
+            # 退避、立刻发起下一轮，变成高频忙循环。
             if not isinstance(item, dict):
-                continue
+                raise ApolloProtocolError(
+                    f"notifications 项应为对象，实际是 {type(item).__name__}"
+                )
             ns = item.get("namespaceName")
             nid = item.get("notificationId")
-            if ns is None or not isinstance(nid, int) or isinstance(nid, bool):
+            if not isinstance(ns, str) or not ns:
+                raise ApolloProtocolError("notifications 项缺少 namespaceName")
+            if not isinstance(nid, int) or isinstance(nid, bool):
+                raise ApolloProtocolError(
+                    f"namespace={ns} 的 notificationId 应为整数"
+                )
+            if ns not in self._notification_ids:
+                # 服务端返回了我们没订阅的 namespace，忽略即可（不是协议错误）
+                logger.warning("收到未订阅 namespace 的通知: %s", ns)
                 continue
             # 用"不相等"而不是"更大"：Config Service 重启或轮换到别的实例后，
             # 服务端的 notificationId 可能比客户端持有的更小。要求单调递增会

@@ -146,25 +146,21 @@ def test_smaller_notification_id_is_accepted(client_kwargs):
     """服务端重启或轮换实例后 notificationId 可能变小，不能要求单调递增。
 
     官方客户端按"id 是否变化"处理。要求递增会让这种情况下热更新永久失效。
+
+    不调 start()——后台轮询线程会抢先消费掉通知，让测试变成竞态。这里直接
+    驱动 _poll_once() 以获得确定性。
     """
     with requests_mock.Mocker() as m:
-        m.get(
-            CONFIGS_PATH,
-            [
-                {"json": config_payload({"K": "V1"}, "rk1")},
-                {"json": config_payload({"K": "V2"}, "rk2")},
-            ],
-        )
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V2"}, "rk2"))
         m.get(NOTIFY_PATH, json=notification_payload(notification_id=5))
         client = ApolloClient(**client_kwargs)
-        client.start()
         client._notification_ids["application"] = 100
 
         updated = client._poll_once()
-        client.stop()
 
     assert updated == ["application"], "变小的 id 也应触发拉取"
     assert client._notification_ids["application"] == 5
+    assert client.get_value("K") == "V2"
 
 
 def test_equal_notification_id_is_skipped(client_kwargs):
@@ -249,3 +245,84 @@ def test_callback_receives_independent_copy(client_kwargs):
         client.stop()
 
     assert received == ["first", ["K"]], "第二个回调仍应看到完整的 changes"
+
+
+def test_malformed_notification_item_raises(client_kwargs):
+    """畸形通知项应抛协议错误，而不是静默跳过。
+
+    静默跳过会让 _poll_once 返回空列表、被当成成功，于是没有退避、立刻发起
+    下一轮——服务端持续返回同样的畸形响应时就是高频忙循环。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        m.get(NOTIFY_PATH, json=["not-a-dict"])
+        client = ApolloClient(**client_kwargs)
+        client.start()
+        with pytest.raises(ApolloProtocolError, match="应为对象"):
+            client._poll_once()
+        client.stop()
+
+
+def test_non_integer_notification_id_raises(client_kwargs):
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        m.get(
+            NOTIFY_PATH,
+            json=[{"namespaceName": "application", "notificationId": "abc"}],
+        )
+        client = ApolloClient(**client_kwargs)
+        client.start()
+        with pytest.raises(ApolloProtocolError, match="整数"):
+            client._poll_once()
+        client.stop()
+
+
+def test_unsubscribed_namespace_notification_is_ignored(client_kwargs):
+    """收到未订阅 namespace 的通知只告警，不是协议错误。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
+        m.get(
+            NOTIFY_PATH,
+            json=[{"namespaceName": "someone-else", "notificationId": 3}],
+        )
+        client = ApolloClient(**client_kwargs)
+        client.start()
+        assert client._poll_once() == []
+        client.stop()
+
+
+def test_frozen_snapshot_not_captured_on_hard_startup_failure(client_kwargs):
+    """allow_fallback=False 启动失败时不应固化冻结快照。
+
+    调用方可能在 Apollo 恢复后复用同一客户端重试 start()；若此刻已标记
+    captured，重试成功后新拉到的冻结值将永远不可见。
+    """
+    import requests
+
+    from apollocfg.errors import ConfigServiceUnavailable
+
+    with requests_mock.Mocker() as m:
+        m.get(
+            CONFIGS_PATH,
+            [
+                {"exc": requests.exceptions.ConnectTimeout},
+                {"json": config_payload({"DSN": "mysql://recovered"}, "rk2")},
+            ],
+        )
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            frozen_keys=["DSN"],
+            static_fallback={"application": {"DSN": "APOLLO_REQUIRED"}},
+            allow_fallback=False,
+            **client_kwargs,
+        )
+        with pytest.raises(ConfigServiceUnavailable):
+            client.start()
+
+        # Apollo 恢复后重试
+        client.start()
+        client.stop()
+
+    assert client.get_value("DSN") == "mysql://recovered", (
+        "启动失败后重试成功，应拿到真实的冻结值而不是固化的哨兵值"
+    )
