@@ -11,7 +11,18 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Type, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Type,
+    TypeVar,
+)
 
 from apollocfg.client import DEFAULT_NAMESPACE, ApolloClient, ResolvedAssertion
 
@@ -41,6 +52,8 @@ class ConfigManager:
         required_keys: Optional[Iterable[str]] = None,
         frozen_keys: Optional[Iterable[str]] = None,
         allow_fallback: bool = True,
+        require_resolved_keys: bool = False,
+        static_fallback: Optional[Mapping[str, Mapping[str, str]]] = None,
         on_resolved: Optional[ResolvedAssertion] = None,
         poll_timeout: int = 90,
         request_timeout: int = 5,
@@ -59,6 +72,8 @@ class ConfigManager:
             required_keys=required_keys,
             frozen_keys=frozen_keys,
             allow_fallback=allow_fallback,
+            require_resolved_keys=require_resolved_keys,
+            static_fallback=static_fallback,
             on_resolved=on_resolved,
             poll_timeout=poll_timeout,
             request_timeout=request_timeout,
@@ -120,6 +135,10 @@ class ConfigManager:
 
     def get_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
         return self._client.get_configs(namespace)
+
+    def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
+        """最终生效的配置：静态兜底值被 Apollo 的值覆盖。"""
+        return self._client.effective_configs(namespace)
 
     def get_typed(self, namespace: str, model_cls: Type[T]) -> T:
         """用任意模型类解析某个 namespace 的配置。

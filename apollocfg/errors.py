@@ -12,6 +12,14 @@ class ApolloError(Exception):
     """本库所有异常的基类。"""
 
 
+class ApolloProtocolError(ApolloError):
+    """服务端响应不符合 Apollo 协议（例如 2xx 却没有 body）。
+
+    单独成类是为了和"网络不可达"区分开：这种情况通常意味着中间有代理在干预
+    （返回了自己的错误页或空响应），而不是 Config Service 本身的状态。
+    """
+
+
 class ConfigServiceUnavailable(ApolloError):
     """所有 Config Service 实例都不可用（网络不可达 / 全部返回错误）。
 

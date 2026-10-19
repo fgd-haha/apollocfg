@@ -37,6 +37,7 @@ import requests
 from requests import Request
 
 from apollocfg.errors import (
+    ApolloProtocolError,
     ConfigServiceUnavailable,
     RequiredKeysMissing,
     StartupAssertionFailed,
@@ -57,6 +58,10 @@ DEFAULT_NAMESPACE = "application"
 # Apollo 服务端长轮询默认挂起 60s；客户端读超时必须更长，否则每轮都会在服务端
 # 应答之前被客户端自己掐断。这是多个第三方 Python 客户端的共同缺陷。
 _SERVER_LONG_POLL_SECONDS = 60
+
+# 连续多少次长轮询超时后判定当前实例有问题并轮换。单次超时多半是网络抖动，
+# 立刻换地址会在抖动时造成不必要的实例漂移。
+_MAX_CONSECUTIVE_TIMEOUTS = 3
 
 
 def _normalize_keys(
@@ -104,6 +109,8 @@ class ApolloClient:
         required_keys: Optional[Iterable[str]] = None,
         frozen_keys: Optional[Iterable[str]] = None,
         allow_fallback: bool = True,
+        require_resolved_keys: bool = False,
+        static_fallback: Optional[Mapping[str, Mapping[str, str]]] = None,
         on_resolved: Optional[ResolvedAssertion] = None,
         poll_timeout: int = 90,
         request_timeout: int = 5,
@@ -125,7 +132,14 @@ class ApolloClient:
         self.client_ip = client_ip
         self.access_key_secret = access_key_secret
         self.allow_fallback = allow_fallback
+        self.require_resolved_keys = require_resolved_keys
         self.on_resolved = on_resolved
+        # 调用方的静态兜底值。只用于两件事：required_keys 的"已解析"判定，
+        # 以及传给 on_resolved 的"最终生效配置"。不进 _configs，也不参与 diff，
+        # 所以不会触发变更回调。
+        self.static_fallback: Dict[str, Dict[str, str]] = {
+            ns: dict(values) for ns, values in (static_fallback or {}).items()
+        }
         self.poll_timeout = poll_timeout
         self.request_timeout = request_timeout
         self.poll_interval = poll_interval
@@ -164,11 +178,28 @@ class ApolloClient:
         return cb
 
     def get_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
-        """返回某个 namespace 的配置副本（已套用 frozen_keys 快照）。"""
+        """返回某个 namespace 来自 Apollo 的配置副本（已套用 frozen_keys 快照）。
+
+        不含 ``static_fallback``——那是调用方自己的值，调用方本来就能读到。
+        想要合并后的结果用 :meth:`effective_configs`。
+        """
         with self._lock:
             merged = dict(self._configs.get(namespace, {}))
             merged.update(self._frozen_snapshot.get(namespace, {}))
             return merged
+
+    def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
+        """返回「最终生效」的配置：静态兜底值被 Apollo 的值覆盖。
+
+        这是 ``required_keys`` 判定和 ``on_resolved`` 断言所依据的视图——只看
+        Apollo 的值会把"回退到静态配置"误判成"什么都没有"。
+        """
+        merged = dict(self.static_fallback.get(namespace, {}))
+        for key, value in self.get_configs(namespace).items():
+            # Apollo 下发空白值不应覆盖掉调用方的有效兜底值
+            if (value or "").strip() or key not in merged:
+                merged[key] = value
+        return merged
 
     def get_value(
         self,
@@ -264,15 +295,19 @@ class ApolloClient:
     def _check_required_keys(self) -> None:
         """校验 ``required_keys`` 全部解析出了非空值。
 
-        ``allow_fallback=True`` 时只告警（调用方的静态配置会兜底，并且通常由
-        ``on_resolved`` 哨兵断言来兜住"回退到了错误的值"这种情况）；
-        ``allow_fallback=False`` 时抛 :class:`RequiredKeysMissing`。
+        判定依据是 :meth:`effective_configs`——Apollo 的值叠加调用方的静态兜底。
+        所以"Apollo 没给但静态配置里有"算解析成功（这正是 fallback 的意义），
+        而"两边都没有"才算缺失。
+
+        缺失时的行为由 ``require_resolved_keys`` 决定，**与 ``allow_fallback``
+        无关**：前者管"key 解析不出来怎么办"，后者管"Apollo 连不上怎么办"，
+        是两个独立的失败模式。
         """
         missing: Dict[str, List[str]] = {}
         for ns, keys in self.required_keys.items():
             if not keys:
                 continue
-            resolved = self.get_configs(ns)
+            resolved = self.effective_configs(ns)
             absent = [k for k in keys if not (resolved.get(k) or "").strip()]
             if absent:
                 missing[ns] = absent
@@ -280,23 +315,24 @@ class ApolloClient:
         if not missing:
             return
 
-        if not self.allow_fallback:
+        if self.require_resolved_keys or not self.allow_fallback:
             raise RequiredKeysMissing(missing)
         logger.warning(
-            "required_keys 未从 Apollo 解析出值，按 allow_fallback=True 继续; missing=%s",
+            "required_keys 未解析出值，按 require_resolved_keys=False 继续; missing=%s",
             {ns: sorted(keys) for ns, keys in missing.items()},
         )
 
     def _run_startup_assertion(self) -> None:
         """执行调用方注入的启动断言。
 
-        调用方可以在这里校验"最终生效的值是否可用"——例如静态配置里放的是哨兵
-        占位符，回退之后值仍是哨兵，就应当拒绝启动而不是带着错配置跑起来。
+        传给回调的是 :meth:`effective_configs`——必须包含静态兜底值，否则哨兵
+        断言这个核心用法就是失效的：Apollo 不可达时回调只会看到 ``{}``，
+        ``configs.get("MYSQL_DSN")`` 返回 None 而不是哨兵，断言反而通过。
         """
         if self.on_resolved is None:
             return
         for ns in self.namespaces:
-            reason = self.on_resolved(ns, self.get_configs(ns))
+            reason = self.on_resolved(ns, self.effective_configs(ns))
             if reason:
                 raise StartupAssertionFailed(f"namespace={ns}: {reason}")
 
@@ -407,20 +443,25 @@ class ApolloClient:
         self, namespace: str, initial: bool = False
     ) -> Dict[str, Dict[str, Any]]:
         """拉取单个 namespace。返回已过滤 frozen_keys 的变更集。"""
-        base = self._ensure_config_url()
-        try:
-            resp = self._request_namespace(base, namespace)
-        except requests.RequestException:
-            if not self._rotate_config_url():
-                raise
-            resp = self._request_namespace(self._ensure_config_url(), namespace)
+        resp = self._request_with_failover(namespace)
 
-        # releaseKey 与服务端一致时 Apollo 返回 304 + 空 body。raise_for_status()
-        # 不拦 304，且对空 body 调 .json() 会抛 JSONDecodeError，所以先短路掉。
-        if resp.status_code == 304 or not resp.text.strip():
+        # releaseKey 与服务端一致时 Apollo 返回 304 + 空 body，表示"无变更"。
+        # 必须先判 304 再判状态码：raise_for_status() 不拦 304。
+        if resp.status_code == 304:
             return {}
 
+        # 必须在"空 body 短路"之前校验状态码。代理层过载时常返回空 body 的
+        # 502/504，若先判空 body 就会把服务端错误误判成"无变更"，于是带着空
+        # 配置启动成功——allow_fallback=False 也挡不住。
         resp.raise_for_status()
+
+        if not resp.text.strip():
+            # 2xx 却没有 body，不符合 Apollo 协议。当作错误而不是"无变更"，
+            # 否则同样会静默地把空配置当成有效结果。
+            raise ApolloProtocolError(
+                f"namespace={namespace} 返回 HTTP {resp.status_code} 但 body 为空"
+            )
+
         data = resp.json()
         new_configs: Dict[str, str] = data.get("configurations") or {}
         new_release = data.get("releaseKey") or ""
@@ -465,6 +506,42 @@ class ApolloClient:
             self._dispatch(namespace, changes)
         return changes
 
+    def _request_with_failover(self, namespace: str) -> requests.Response:
+        """拉取配置，连接失败时依次尝试服务池里所有未试过的实例。
+
+        只重试一次是不够的：三个实例、前两个都挂的情况下，单次轮换仍会失败，
+        而服务发现的意义正是"有健康实例就该找到它"。
+
+        注意只对连接层异常做 failover。HTTP 状态码不在这里判断——4xx 通常是
+        appId/namespace 配错或验签失败，换实例也是一样的结果，重试只会放大错误。
+        """
+        attempted: List[str] = []
+        last_exc: Optional[requests.RequestException] = None
+
+        while True:
+            base = self._ensure_config_url()
+            if base in attempted:
+                # 已经绕回试过的实例，说明池里的都试完了
+                break
+            attempted.append(base)
+            try:
+                return self._request_namespace(base, namespace)
+            except requests.RequestException as exc:
+                last_exc = exc
+                logger.warning("namespace=%s 从 %s 拉取失败: %s", namespace, base, exc)
+                if not self._rotate_config_url():
+                    break
+                # 轮换后若池里已无未试过的实例，不必再绕一圈
+                if all(host in attempted for host in self._known_hosts()):
+                    break
+
+        assert last_exc is not None  # 循环至少执行一次，要么 return 要么置 last_exc
+        raise last_exc
+
+    def _known_hosts(self) -> List[str]:
+        with self._addr_lock:
+            return list(self._service_pool)
+
     def _request_namespace(self, base: str, namespace: str) -> requests.Response:
         url = f"{base}/configs/{self.app_id}/{self.cluster}/{namespace}"
         params: Dict[str, Any] = {}
@@ -502,18 +579,31 @@ class ApolloClient:
         而且没有任何报错，是最难排查的故障形态。所以最外层兜一个 Exception。
         """
         backoff = self.poll_interval
+        consecutive_timeouts = 0
         while not self._stop_event.is_set():
             try:
                 changed = self._poll_once()
                 backoff = self.poll_interval
+                consecutive_timeouts = 0
                 if changed is None:
                     # 服务端挂起到超时返回 304，属正常，立即续下一轮
                     continue
             except requests.exceptions.Timeout:
-                # 客户端读超时。poll_timeout > 服务端 60s，正常不该走到这里，
-                # 但网络抖动可能触发，按正常无变更处理。
+                # 客户端读超时。poll_timeout > 服务端挂起时长，所以单次超时多半是
+                # 网络抖动，直接续下一轮即可，不退避也不换地址。
+                #
+                # 但连续超时就不是抖动了——当前实例或链路有问题。此时必须轮换，
+                # 否则会永久钉在这个实例上，热更新静默失效且没有任何报错。
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
+                    logger.warning(
+                        "连续 %d 次长轮询超时，轮换 Config Service", consecutive_timeouts
+                    )
+                    self._rotate_config_url()
+                    consecutive_timeouts = 0
                 continue
             except Exception as exc:  # noqa: BLE001 - 见上方说明
+                consecutive_timeouts = 0
                 logger.warning("长轮询异常，%.1fs 后重试: %s", backoff, exc)
                 self._rotate_config_url()
                 if self._stop_event.wait(backoff):

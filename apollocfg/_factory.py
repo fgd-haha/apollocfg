@@ -6,7 +6,7 @@ Django settings / FastAPI lifespan）自行决定是否缓存为单例。
 from __future__ import annotations
 
 import os
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Mapping, Optional, Sequence
 
 from apollocfg.client import ResolvedAssertion
 from apollocfg.manager import ConfigManager
@@ -40,6 +40,8 @@ def create_config_manager(
     required_keys: Optional[Iterable[str]] = None,
     frozen_keys: Optional[Iterable[str]] = None,
     allow_fallback: bool = True,
+    require_resolved_keys: bool = False,
+    static_fallback: Optional[Mapping[str, Mapping[str, str]]] = None,
     on_resolved: Optional[ResolvedAssertion] = None,
     auto_start: bool = True,
     poll_timeout: int = 90,
@@ -50,7 +52,7 @@ def create_config_manager(
     """以显式参数创建 ConfigManager。
 
     ``auto_start=True``（默认）时立即拉取一次全量配置、校验契约并启动长轮询线程；
-    契约校验失败会按 ``allow_fallback`` 的设置抛异常。
+    契约校验失败时抛异常（见 ``allow_fallback`` / ``require_resolved_keys``）。
     """
     manager = ConfigManager(
         app_id=app_id,
@@ -64,6 +66,8 @@ def create_config_manager(
         required_keys=required_keys,
         frozen_keys=frozen_keys,
         allow_fallback=allow_fallback,
+        require_resolved_keys=require_resolved_keys,
+        static_fallback=static_fallback,
         on_resolved=on_resolved,
         poll_timeout=poll_timeout,
         request_timeout=request_timeout,
@@ -78,6 +82,7 @@ def create_config_manager(
 def create_config_manager_from_env(
     auto_start: bool = True,
     on_resolved: Optional[ResolvedAssertion] = None,
+    static_fallback: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> ConfigManager:
     """从环境变量构建 ConfigManager。
 
@@ -91,11 +96,14 @@ def create_config_manager_from_env(
         APOLLO_ENV                环境名（可选）
         APOLLO_CLIENT_IP          灰度发布用的客户端 IP（可选）
         APOLLO_ACCESS_KEY_SECRET  访问密钥（可选，留空走匿名）
-        APOLLO_REQUIRED_KEYS      逗号分隔，必须来自 Apollo 的 key
+        APOLLO_REQUIRED_KEYS      逗号分隔，必须解析出值的 key
         APOLLO_FROZEN_KEYS        逗号分隔，禁止热更新的 key
         APOLLO_ALLOW_FALLBACK     Apollo 不可达时是否降级（默认 true）
+        APOLLO_REQUIRE_RESOLVED_KEYS
+                                  required_keys 缺失时是否拒绝启动（默认 false）
 
-    ``on_resolved`` 只能通过参数传入——它是可调用对象，没法用环境变量表达。
+    ``on_resolved`` 与 ``static_fallback`` 只能通过参数传入——前者是可调用对象，
+    后者是嵌套映射，都没法用环境变量表达。
 
     若已安装 ``python-dotenv``，会先调用 ``load_dotenv()``（未安装则跳过）。
 
@@ -130,6 +138,8 @@ def create_config_manager_from_env(
         required_keys=_split_env_list("APOLLO_REQUIRED_KEYS"),
         frozen_keys=_split_env_list("APOLLO_FROZEN_KEYS"),
         allow_fallback=_env_bool("APOLLO_ALLOW_FALLBACK", True),
+        require_resolved_keys=_env_bool("APOLLO_REQUIRE_RESOLVED_KEYS", False),
+        static_fallback=static_fallback,
         on_resolved=on_resolved,
         auto_start=auto_start,
     )

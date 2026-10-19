@@ -110,11 +110,30 @@ allow_fallback=False   # Apollo 不可达时抛 ConfigServiceUnavailable，拒�
 适用场景不同：有些部署环境（比如和配置中心网络不通的旧环境）本来就读不到 Apollo，
 需要用代码里的静态配置正常运行；而切换窗口期的新环境必须确保配置来自 Apollo。
 
-### `on_resolved` —— 启动断言
+### `require_resolved_keys` —— key 缺失时是否拒绝启动
+
+和 `allow_fallback` 正交：后者管"Apollo **连不上**怎么办"，前者管"Apollo 连上了但
+**key 没给**怎么办"。这是两个独立的失败模式，概率和处置方式都不同。
+
+```python
+ApolloClient(
+    required_keys=["MYSQL_DSN"],
+    allow_fallback=True,          # 允许 Apollo 不可达时降级
+    require_resolved_keys=True,   # 但 key 解析不出来就拒绝启动
+)
+```
+
+默认 `False`（只告警）。`allow_fallback=False` 隐含 `require_resolved_keys=True`——
+既然不允许降级，自然也不接受缺 key。
+
+### `static_fallback` + `on_resolved` —— 启动断言
 
 `allow_fallback=True` 有个隐含风险：**回退到静态配置，可能回退到一份错误的配置**。
+比如切换窗口期，Apollo 里是新地址、代码里还是旧地址，Apollo 一旦拉取失败就静默连回旧库。
 
-解法是在静态配置里放哨兵占位符，启动时断言最终生效的值不是哨兵：
+解法是在静态配置里放哨兵占位符，启动时断言最终生效的值不是哨兵。这需要把静态值
+告诉客户端——否则回调只能看到 Apollo 侧的空配置，`configs.get(...)` 返回 `None`
+而不是哨兵，断言会错误地通过：
 
 ```python
 def reject_sentinel(namespace, configs):
@@ -122,14 +141,29 @@ def reject_sentinel(namespace, configs):
         return "MYSQL_DSN 仍是哨兵值，Apollo 未下发真实配置"
     return None   # 返回 None 或 "" 表示通过
 
-client = ApolloClient(..., on_resolved=reject_sentinel)
+client = ApolloClient(
+    app_id="app",
+    meta_server="http://meta.example.com",
+    static_fallback={"application": {"MYSQL_DSN": "APOLLO_REQUIRED"}},
+    on_resolved=reject_sentinel,
+)
 client.start()   # 断言失败抛 StartupAssertionFailed
 ```
 
-断言在降级**之后**执行，所以它能挡住"Apollo 没拉到、回退到哨兵"这条路径。
+`static_fallback` 只用于两件事：`required_keys` 的"已解析"判定，以及传给
+`on_resolved` 的最终生效配置。它不进内部配置表、不参与 diff，所以不会触发变更回调。
 
-这比依赖 `allow_fallback=False` 更稳：后者要求"开关必须被正确设置"，而哨兵值即使开关
-丢失也会失败。
+两个读取方法的区别：
+
+| 方法 | 返回 |
+|---|---|
+| `get_configs(ns)` | 只有 Apollo 的值（已套用冻结快照） |
+| `effective_configs(ns)` | 静态兜底值被 Apollo 的值覆盖后的结果 |
+
+Apollo 下发空白值不会覆盖掉有效的静态兜底值。
+
+断言在降级**之后**执行，所以能挡住"Apollo 没拉到、回退到哨兵"这条路径。这比依赖
+`allow_fallback=False` 更稳：后者要求"开关必须被正确设置"，而哨兵值即使开关丢失也会失败。
 
 ## 服务发现
 
@@ -234,9 +268,13 @@ pip install apollocfg[dotenv]
 ```
 ApolloError
 ├── ConfigServiceUnavailable   所有实例不可达（allow_fallback=False 时抛）
+├── ApolloProtocolError        响应不符合 Apollo 协议（如 2xx 但 body 为空）
 ├── RequiredKeysMissing        required_keys 未解析出值，.missing 按 namespace 聚合
 └── StartupAssertionFailed     on_resolved 拒绝了最终配置，.reason 为原因
 ```
+
+`ApolloProtocolError` 单独成类是为了区分"网络不可达"和"中间有代理在干预"——
+后者通常表现为代理返回了自己的错误页或空响应。
 
 ## 构造参数
 
@@ -251,7 +289,9 @@ ApolloError
 | `access_key_secret` | 访问密钥 | `None` |
 | `required_keys` | 必需 key | `None` |
 | `frozen_keys` | 冻结 key | `None` |
-| `allow_fallback` | 允许降级 | `True` |
+| `allow_fallback` | Apollo 不可达时允许降级 | `True` |
+| `require_resolved_keys` | key 缺失时拒绝启动 | `False` |
+| `static_fallback` | 调用方静态兜底值 `{ns: {key: value}}` | `None` |
 | `on_resolved` | 启动断言 | `None` |
 | `poll_timeout` | 长轮询读超时，必须 > 60 | `90` |
 | `request_timeout` | 普通请求超时 | `5` |

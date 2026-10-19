@@ -46,6 +46,7 @@ from apollocfg._factory import create_config_manager, create_config_manager_from
 from apollocfg.client import ApolloClient, ChangeCallback, ResolvedAssertion
 from apollocfg.errors import (
     ApolloError,
+    ApolloProtocolError,
     ConfigServiceUnavailable,
     RequiredKeysMissing,
     StartupAssertionFailed,
@@ -66,6 +67,7 @@ except ImportError:  # pragma: no cover - Python < 3.8
 __all__ = [
     "ApolloClient",
     "ApolloError",
+    "ApolloProtocolError",
     "ChangeCallback",
     "ConfigManager",
     "ConfigServiceUnavailable",

@@ -278,3 +278,119 @@ def test_on_resolved_runs_after_fallback(client_kwargs):
         client.stop()
 
     assert seen == [("application", {})]
+
+
+def test_on_resolved_sees_static_fallback_when_apollo_unreachable(client_kwargs):
+    """Apollo 不可达时，断言必须看到调用方的静态兜底值。
+
+    这是哨兵用法能否生效的关键：如果回调只看到 Apollo 的空配置，
+    ``configs.get("MYSQL_DSN")`` 返回 None 而不是哨兵，断言就会错误地通过，
+    服务带着未解析的哨兵值启动。
+    """
+
+    def reject_sentinel(namespace, configs):
+        if configs.get("MYSQL_DSN") == "APOLLO_REQUIRED":
+            return "MYSQL_DSN 仍是哨兵占位符"
+        return None
+
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, exc=requests.exceptions.ConnectTimeout)
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            on_resolved=reject_sentinel,
+            static_fallback={"application": {"MYSQL_DSN": "APOLLO_REQUIRED"}},
+            allow_fallback=True,
+            **client_kwargs,
+        )
+        with pytest.raises(StartupAssertionFailed, match="哨兵"):
+            client.start()
+
+
+def test_apollo_value_overrides_static_fallback(client_kwargs):
+    """Apollo 有值时覆盖静态兜底，哨兵断言应当放行。"""
+
+    def reject_sentinel(namespace, configs):
+        if configs.get("MYSQL_DSN") == "APOLLO_REQUIRED":
+            return "仍是哨兵"
+        return None
+
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"MYSQL_DSN": "mysql://real"}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            on_resolved=reject_sentinel,
+            static_fallback={"application": {"MYSQL_DSN": "APOLLO_REQUIRED"}},
+            **client_kwargs,
+        )
+        client.start()
+        client.stop()
+
+    assert client.effective_configs("application")["MYSQL_DSN"] == "mysql://real"
+    # get_configs 只反映 Apollo 侧，不含静态兜底
+    assert client.get_configs("application") == {"MYSQL_DSN": "mysql://real"}
+
+
+def test_static_fallback_satisfies_required_keys(client_kwargs):
+    """静态兜底里有值就算"已解析"——这正是 fallback 的意义。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"A": "1"}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            required_keys=["A", "B"],
+            static_fallback={"application": {"B": "static-value"}},
+            require_resolved_keys=True,
+            **client_kwargs,
+        )
+        client.start()  # 不应抛异常
+        client.stop()
+
+    assert client.effective_configs("application") == {"A": "1", "B": "static-value"}
+
+
+def test_apollo_blank_value_does_not_override_static_fallback(client_kwargs):
+    """Apollo 下发空白值不该覆盖掉有效的静态兜底值。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"A": "   "}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            static_fallback={"application": {"A": "static-value"}}, **client_kwargs
+        )
+        client.start()
+        client.stop()
+
+    assert client.effective_configs("application")["A"] == "static-value"
+
+
+# ------------- require_resolved_keys 与 allow_fallback 的正交性 -------------
+def test_require_resolved_keys_independent_of_allow_fallback(client_kwargs):
+    """两个开关管的是不同的失败模式，必须能独立控制。
+
+    场景：允许 Apollo 不可达时降级（allow_fallback=True），但一旦 Apollo
+    响应成功就要求 key 必须齐全（require_resolved_keys=True）。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"A": "1"}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            required_keys=["A", "B"],
+            allow_fallback=True,
+            require_resolved_keys=True,
+            **client_kwargs,
+        )
+        with pytest.raises(RequiredKeysMissing) as excinfo:
+            client.start()
+
+    assert excinfo.value.missing == {"application": ["B"]}
+
+
+def test_require_resolved_keys_defaults_to_lenient(client_kwargs, caplog):
+    """默认（False）时缺 key 只告警——调用方的静态配置兜底。"""
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"A": "1"}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(required_keys=["A", "B"], **client_kwargs)
+        with caplog.at_level("WARNING", logger="apollocfg"):
+            client.start()
+        client.stop()
+
+    assert any("required_keys" in r.message for r in caplog.records)
