@@ -481,3 +481,32 @@ def test_malformed_meta_server_response_returns_empty(payload):
         m.get(f"{META_URL}/services/config", json=payload)
         client = ApolloClient(app_id="unit-app", meta_server=META_URL, poll_timeout=61)
         assert client._discover_services() == []
+
+
+def test_frozen_value_survives_assertion_failure_and_304_retry(client_kwargs):
+    """首次拉到冻结值但断言拒绝、重试走 304 时，冻结值不能丢。
+
+    回滚快照必须同时清掉 releaseKey，否则重试会收到 304、_fetch_namespace
+    直接返回而不重建快照，冻结值永久缺失。
+    """
+    from apollocfg.errors import StartupAssertionFailed
+
+    attempts = {"n": 0}
+
+    def reject_first(namespace, configs):
+        attempts["n"] += 1
+        return "首次先拒绝" if attempts["n"] == 1 else None
+
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"DSN": "mysql://real"}, "rk1"))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(
+            frozen_keys=["DSN"], on_resolved=reject_first, **client_kwargs
+        )
+        with pytest.raises(StartupAssertionFailed):
+            client.start()
+
+        client.start()
+        client.stop()
+
+    assert client.get_value("DSN") == "mysql://real", "重试后冻结值不应丢失"

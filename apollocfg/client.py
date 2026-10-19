@@ -435,13 +435,22 @@ class ApolloClient:
                 )
 
     def _capture_pending_frozen(self) -> None:
-        """为启动时拉取失败的 namespace 补建冻结快照（只有静态兜底值可用）。"""
+        """为启动时拉取失败的 namespace 补建冻结快照（只有静态兜底值可用）。
+
+        读未经过滤的 ``_configs`` 而不是 ``get_configs()``：后者会把"声明冻结
+        但未捕获"的 key 过滤掉，用它来建快照等于拿已过滤的数据重建，结果恒为空。
+        """
         for ns in self.namespaces:
             if ns not in self._frozen_captured:
-                self._capture_frozen(ns, self.get_configs(ns))
+                with self._lock:
+                    raw = dict(self._configs.get(ns, {}))
+                self._capture_frozen(ns, raw)
 
     def _discard_frozen_snapshots(self) -> None:
         """丢弃全部冻结快照，让下一次 ``start()`` 重新建立。
+
+        同时清掉 ``_release_keys``：否则重试时会带上旧的 releaseKey 而收到
+        304，``_fetch_namespace`` 直接返回、不会重建快照，冻结值就永久丢了。
 
         只在启动失败路径上调用——成功启动后冻结值必须保持不变。
         """
@@ -449,6 +458,8 @@ class ApolloClient:
             self._frozen_captured.clear()
             self._frozen_snapshot = {ns: {} for ns in self.namespaces}
             self._frozen_effective = {ns: {} for ns in self.namespaces}
+            # 强制下次拉取拿到完整响应而不是 304
+            self._release_keys.clear()
 
     # ------------------------- 契约校验 -------------------------
     def _check_required_keys(self) -> None:
