@@ -164,17 +164,19 @@ def test_smaller_notification_id_is_accepted(client_kwargs):
 
 
 def test_equal_notification_id_is_skipped(client_kwargs):
-    """id 相同才是"无变更"，不应重复拉取。"""
+    """id 相同才是"无变更"，不应重复拉取。
+
+    不调 start()——后台轮询线程会并发拉取，让 call_count 断言变成竞态。
+    直接驱动 _poll_once() 以获得确定性。
+    """
     with requests_mock.Mocker() as m:
         configs = m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
         m.get(NOTIFY_PATH, json=notification_payload(notification_id=7))
         client = ApolloClient(**client_kwargs)
-        client.start()
         client._notification_ids["application"] = 7
         before = configs.call_count
 
         assert client._poll_once() == []
-        client.stop()
 
     assert configs.call_count == before, "id 未变不应触发拉取"
 
