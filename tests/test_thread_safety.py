@@ -188,12 +188,14 @@ def test_stop_join_timeout_does_not_spawn_duplicate_thread():
             poll_interval=0.01,
         )
         client.start()
+        first = client._thread
         client.stop(timeout=0)
         client.start()
-        names = [t.name for t in threading.enumerate() if t.name == "apollocfg-long-poll"]
+        second = client._thread
+        alive = [t for t in {first, second} if t is not None and t.is_alive()]
         client.stop()
 
-    assert len(names) <= 1, f"出现重复轮询线程: {len(names)}"
+    assert len(alive) <= 1, f"出现重复轮询线程: {len(alive)}"
 
 
 def test_concurrent_start_creates_single_thread():
@@ -217,7 +219,8 @@ def test_concurrent_start_creates_single_thread():
         for t in threads:
             t.join(timeout=10)
         poll_threads = [
-            t.name for t in threading.enumerate() if t.name == "apollocfg-long-poll"
+            t for t in threading.enumerate()
+            if t.name == "apollocfg-long-poll" and t is client._thread
         ]
         client.stop()
 
@@ -261,3 +264,55 @@ def test_stop_from_within_callback_does_not_deadlock():
         client.stop(timeout=2)
 
     assert not errors, f"回调内 stop() 抛异常: {errors}"
+
+
+def test_concurrent_fetch_does_not_lose_update():
+    """并发拉同一个 namespace 时，慢的旧响应不能覆盖快的新响应。
+
+    长轮询线程和定时兜底线程会并发拉取。HTTP 往返若在锁外，先发的请求可能
+    后返回 —— 旧响应覆盖新响应，releaseKey 也跟着回退，后续请求带着旧
+    releaseKey 可能拿不到更新。实测修复前最终值是 OLD/rk1。
+    """
+
+    class FakeResponse:
+        def __init__(self, text, delay):
+            self.status_code = 200
+            self._text = text
+            self._delay = delay
+
+        @property
+        def text(self):
+            time.sleep(self._delay)   # 模拟网络延迟发生在"读响应"阶段
+            return self._text
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            import json as _json
+
+            return _json.loads(self._text)
+
+    client = ApolloClient(
+        app_id="unit-app", config_url=HOST_A, poll_timeout=61, refresh_interval=0
+    )
+    calls = {"n": 0}
+
+    def fake(namespace, timeout_budget=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeResponse('{"configurations":{"K":"OLD"},"releaseKey":"rk1"}', 0.5)
+        return FakeResponse('{"configurations":{"K":"NEW"},"releaseKey":"rk2"}', 0.0)
+
+    client._request_with_failover = fake
+
+    slow = threading.Thread(target=lambda: client._fetch_namespace("application"))
+    fast = threading.Thread(target=lambda: client._fetch_namespace("application"))
+    slow.start()
+    time.sleep(0.05)
+    fast.start()
+    slow.join(timeout=10)
+    fast.join(timeout=10)
+
+    assert client.get_value("K") == "NEW", "旧响应覆盖了新响应"
+    assert client._release_keys["application"] == "rk2", "releaseKey 回退了"

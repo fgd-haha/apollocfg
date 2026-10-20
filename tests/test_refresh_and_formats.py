@@ -178,16 +178,34 @@ def test_get_json_parses_content():
     assert isinstance(raw, str)
 
 
-def test_get_json_rejects_missing_content(client_kwargs):
-    """properties namespace 没有 content，调 get_json 要给出可操作的报错。"""
+def test_get_json_rejects_properties_namespace(client_kwargs):
+    """properties namespace 调 get_json 要按后缀直接拒绝，并给出可操作提示。"""
     with requests_mock.Mocker() as m:
         m.get(CONFIGS_PATH, json=config_payload({"K": "V"}))
         m.get(NOTIFY_PATH, status_code=304)
         client = ApolloClient(**client_kwargs)
         client.start()
-        with pytest.raises(ApolloProtocolError, match="content"):
-            client.get_json("application")
-        client.stop()
+        try:
+            with pytest.raises(ApolloProtocolError, match="后缀"):
+                client.get_json("application")
+        finally:
+            client.stop()
+
+
+def test_properties_namespace_with_content_key_not_mistaken(client_kwargs):
+    """properties namespace 里有个名叫 content 的正常配置项，不能被当成 json 格式。
+
+    靠 set(configs) == {"content"} 推断格式会把这种 namespace 整个丢掉。
+    """
+    with requests_mock.Mocker() as m:
+        m.get(CONFIGS_PATH, json=config_payload({"content": "这是一个正常的配置值"}))
+        m.get(NOTIFY_PATH, status_code=304)
+        client = ApolloClient(**client_kwargs)
+        client.start()
+        try:
+            assert client.merged_configs() == {"content": "这是一个正常的配置值"}
+        finally:
+            client.stop()
 
 
 def test_get_json_rejects_malformed_json():
@@ -380,7 +398,6 @@ def test_refresh_fetches_without_poll(client_kwargs):
 
 
 def test_refresh_thread_stops_with_client(client_kwargs):
-    import threading as _th
 
     kwargs = dict(client_kwargs)
     kwargs["refresh_interval"] = 0.2
@@ -389,16 +406,15 @@ def test_refresh_thread_stops_with_client(client_kwargs):
         m.get(NOTIFY_PATH, status_code=304)
         client = ApolloClient(**kwargs)
         client.start()
-        assert any(t.name == "apollocfg-refresh" for t in _th.enumerate())
+        refresher = client._refresh_thread
+        assert refresher is not None and refresher.is_alive()
         client.stop()
 
-    assert not any(t.name == "apollocfg-refresh" for t in _th.enumerate()), (
-        "stop() 后兜底线程应已退出"
-    )
+    assert client._refresh_thread is None, "stop() 后应已回收兜底线程引用"
+    assert not refresher.is_alive(), "stop() 后兜底线程应已退出"
 
 
 def test_no_refresh_thread_when_disabled(client_kwargs):
-    import threading as _th
 
     kwargs = dict(client_kwargs)
     kwargs["refresh_interval"] = 0
@@ -407,7 +423,7 @@ def test_no_refresh_thread_when_disabled(client_kwargs):
         m.get(NOTIFY_PATH, status_code=304)
         client = ApolloClient(**kwargs)
         client.start()
-        names = [t.name for t in _th.enumerate()]
+        created = client._refresh_thread
         client.stop()
 
-    assert "apollocfg-refresh" not in names
+    assert created is None, "refresh_interval=0 不应创建兜底线程"

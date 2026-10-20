@@ -68,6 +68,20 @@ _SERVER_LONG_POLL_SECONDS = 60
 _MAX_CONSECUTIVE_TIMEOUTS = 3
 
 
+#: 非 properties 格式的 namespace 后缀。Apollo 对这些格式不拆 key-value，
+#: 而是把整段原文放在 ``configurations.content`` 里。
+_STRUCTURED_SUFFIXES = (".json", ".yml", ".yaml", ".xml", ".txt")
+
+
+def _is_structured_namespace(namespace: str) -> bool:
+    """按后缀判断是否为非 properties 格式。
+
+    不能靠"configurations 里只有一个 content key"来推断——properties namespace
+    完全可以有一个正常的、名叫 content 的配置项。
+    """
+    return namespace.lower().endswith(_STRUCTURED_SUFFIXES)
+
+
 def _normalize_keys(
     value: Optional[Iterable[str]], namespaces: Sequence[str]
 ) -> Dict[str, set]:
@@ -186,6 +200,14 @@ class ApolloClient:
         # 地址状态单独加锁：服务发现要发 HTTP，不能占着 _lock 阻塞配置读取。
         # 主线程（start/属性读取）与轮询线程都会碰 _config_url / _service_pool。
         self._addr_lock = threading.RLock()
+        # 每个 namespace 一把拉取锁，串行化对同一 namespace 的拉取。
+        #
+        # 长轮询线程和定时兜底线程会并发拉同一个 namespace。两次拉取的 HTTP
+        # 往返在锁外，先发的请求可能后返回——于是旧响应覆盖新响应，releaseKey
+        # 也跟着回退（实测可复现）。这把锁横跨 HTTP + 写入，彻底消除交叉。
+        # 用独立的锁而不是 _lock：_lock 要保护读路径，不能被 HTTP 占住。
+        self._fetch_locks: Dict[str, threading.Lock] = {}
+        self._fetch_locks_guard = threading.Lock()
         self._configs: Dict[str, Dict[str, str]] = {}
         self._release_keys: Dict[str, str] = {}
         # 冻结快照分两份，避免 static_fallback 泄漏进只应反映 Apollo 的视图：
@@ -330,11 +352,16 @@ class ApolloClient:
         Raises:
             ApolloProtocolError: content 不存在或不是合法 JSON。
         """
+        if not _is_structured_namespace(namespace):
+            raise ApolloProtocolError(
+                f"namespace={namespace} 没有非 properties 格式的后缀"
+                "（json 格式的 namespace 名必须形如 database.json）"
+            )
         raw = self.get_content(namespace)
         if raw is None:
             raise ApolloProtocolError(
                 f"namespace={namespace} 没有 content 字段"
-                "（确认 namespace 名带了 .json 后缀，且格式确实是 json）"
+                "（Apollo 侧该 namespace 的格式可能不是 json）"
             )
         try:
             return json.loads(raw)
@@ -358,10 +385,12 @@ class ApolloClient:
         order = list(namespaces) if namespaces is not None else self.namespaces
         merged: Dict[str, str] = {}
         for ns in order:
-            configs = self.get_configs(ns)
-            if set(configs) == {"content"}:
-                continue  # 非 properties 格式，跳过
-            merged.update(configs)
+            if _is_structured_namespace(ns):
+                # 按后缀判断，不按 key 推断。properties namespace 完全可以有一个
+                # 名叫 content 的正常配置项，靠 set(configs)=={"content"} 判断
+                # 会把它整个丢掉。
+                continue
+            merged.update(self.get_configs(ns))
         return merged
 
     def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
@@ -448,24 +477,30 @@ class ApolloClient:
         deadline = (
             time.monotonic() + self.startup_timeout if self.startup_timeout else None
         )
-        for ns in self.namespaces:
-            if deadline is not None and time.monotonic() >= deadline:
-                # 已超出启动预算，剩余 namespace 不再尝试。拖长启动会让探活失败，
-                # 代价比"少拉一个 namespace"更大——后者长轮询起来后会自己补上。
-                remaining = [n for n in self.namespaces if n not in failures and n != ns]
-                failures[ns] = TimeoutError(
-                    f"startup_timeout({self.startup_timeout}s) 耗尽，跳过 {[ns, *remaining]}"
-                )
-                logger.warning(
-                    "启动预算 %.1fs 耗尽，跳过未拉取的 namespace: %s",
-                    self.startup_timeout,
-                    [ns, *remaining],
-                )
-                for n in remaining:
-                    failures[n] = failures[ns]
-                break
+        for index, ns in enumerate(self.namespaces):
+            remaining_budget = None
+            if deadline is not None:
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0:
+                    # 预算耗尽，剩余 namespace 不再尝试。拖长启动会让探活失败，
+                    # 代价比"少拉一个 namespace"更大——后者长轮询起来后会补上。
+                    skipped = list(self.namespaces[index:])
+                    err = TimeoutError(
+                        f"startup_timeout({self.startup_timeout}s) 耗尽，跳过 {skipped}"
+                    )
+                    logger.warning(
+                        "启动预算 %.1fs 耗尽，跳过未拉取的 namespace: %s",
+                        self.startup_timeout,
+                        skipped,
+                    )
+                    for n in skipped:
+                        failures[n] = err
+                    break
             try:
-                self._fetch_namespace(ns, initial=True)
+                # 把单次请求的超时压到剩余预算以内。只在 namespace 之间检查
+                # deadline 是不够的——单个 namespace 的拉取本身就可能阻塞
+                # request_timeout × 实例轮换次数，远超预算。
+                self._fetch_namespace(ns, initial=True, timeout_budget=remaining_budget)
             except Exception as exc:  # noqa: BLE001 - 汇总后按策略统一处理
                 failures[ns] = exc
 
@@ -819,11 +854,36 @@ class ApolloClient:
         return self._session.get(prepared.url, headers=headers, timeout=timeout)
 
     # ------------------------- 配置拉取 -------------------------
+    def _namespace_fetch_lock(self, namespace: str) -> threading.Lock:
+        with self._fetch_locks_guard:
+            lock = self._fetch_locks.get(namespace)
+            if lock is None:
+                lock = threading.Lock()
+                self._fetch_locks[namespace] = lock
+            return lock
+
     def _fetch_namespace(
-        self, namespace: str, initial: bool = False
+        self,
+        namespace: str,
+        initial: bool = False,
+        timeout_budget: Optional[float] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """拉取单个 namespace。返回已过滤 frozen_keys 的变更集。"""
-        resp = self._request_with_failover(namespace)
+        """拉取单个 namespace。返回已过滤 frozen_keys 的变更集。
+
+        同一 namespace 的拉取是串行的——长轮询线程和定时兜底线程会并发调用，
+        不串行化会出现"旧响应覆盖新响应"（见 ``_fetch_locks`` 的说明）。
+
+        Args:
+            timeout_budget: 本次拉取的总时间预算（秒）。给定时会压低单请求超时，
+                用于 ``start()`` 的 ``startup_timeout``。
+        """
+        with self._namespace_fetch_lock(namespace):
+            return self._fetch_namespace_locked(namespace, initial, timeout_budget)
+
+    def _fetch_namespace_locked(
+        self, namespace: str, initial: bool, timeout_budget: Optional[float] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        resp = self._request_with_failover(namespace, timeout_budget)
 
         # releaseKey 与服务端一致时 Apollo 返回 304 + 空 body，表示"无变更"。
         # 必须先判 304 再判状态码：raise_for_status() 不拦 304。
@@ -921,7 +981,9 @@ class ApolloClient:
             coerced[str(key)] = value if isinstance(value, str) else str(value)
         return coerced, release_key or ""
 
-    def _request_with_failover(self, namespace: str) -> requests.Response:
+    def _request_with_failover(
+        self, namespace: str, timeout_budget: Optional[float] = None
+    ) -> requests.Response:
         """拉取配置，失败时依次尝试服务池里所有未试过的实例。
 
         只重试一次是不够的：三个实例、前两个都挂的情况下，单次轮换仍会失败，
@@ -949,7 +1011,7 @@ class ApolloClient:
             attempted.append(base)
 
             try:
-                resp = self._request_namespace(base, namespace)
+                resp = self._request_namespace(base, namespace, timeout_budget)
             except requests.RequestException as exc:
                 last_error = exc
                 logger.warning("namespace=%s 从 %s 拉取失败: %s", namespace, base, exc)
@@ -994,7 +1056,9 @@ class ApolloClient:
         with self._addr_lock:
             return list(self._service_pool)
 
-    def _request_namespace(self, base: str, namespace: str) -> requests.Response:
+    def _request_namespace(
+        self, base: str, namespace: str, timeout_budget: Optional[float] = None
+    ) -> requests.Response:
         # 路径段必须编码：含 / 或空格的 namespace 会改变 URL 结构，
         # 也会让签名用的 path 和服务端解析的不一致。
         url = (
@@ -1007,7 +1071,11 @@ class ApolloClient:
             params["releaseKey"] = release_key
         if self.client_ip:
             params["ip"] = self.client_ip
-        return self._signed_get(url, params, self.request_timeout)
+        timeout = self.request_timeout
+        if timeout_budget is not None:
+            # 至少留 0.1s，否则等于不发请求
+            timeout = max(0.1, min(timeout, timeout_budget))
+        return self._signed_get(url, params, timeout)
 
     def _dispatch(self, namespace: str, changes: Dict[str, Dict[str, Any]]) -> None:
         """派发变更回调。单个回调抛异常不影响其他回调，也不中断轮询。"""

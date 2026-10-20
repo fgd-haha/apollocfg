@@ -21,6 +21,16 @@ def _split_env_list(name: str, default: str = "") -> List[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
 
+def _env_float(name: str, default: Optional[float]) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} 不是合法的数字: {raw!r}") from exc
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -105,6 +115,8 @@ def create_config_manager_from_env(
         APOLLO_ALLOW_FALLBACK     Apollo 不可达时是否降级（默认 true）
         APOLLO_REQUIRE_RESOLVED_KEYS
                                   required_keys 缺失时是否拒绝启动（默认 false）
+        APOLLO_REFRESH_INTERVAL   定时全量拉取间隔（秒，默认 300，设 0 关闭）
+        APOLLO_STARTUP_TIMEOUT    start() 阻塞上界（秒，默认不限制）
 
     ``on_resolved`` 与 ``static_fallback`` 只能通过参数传入——前者是可调用对象，
     后者是嵌套映射，都没法用环境变量表达。
@@ -145,5 +157,7 @@ def create_config_manager_from_env(
         require_resolved_keys=_env_bool("APOLLO_REQUIRE_RESOLVED_KEYS", False),
         static_fallback=static_fallback,
         on_resolved=on_resolved,
+        refresh_interval=_env_float("APOLLO_REFRESH_INTERVAL", 300.0),
+        startup_timeout=_env_float("APOLLO_STARTUP_TIMEOUT", None),
         auto_start=auto_start,
     )
