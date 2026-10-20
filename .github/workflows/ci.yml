@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # 允许在 Actions 页面手动触发（排查 CI 本身、或 fork 刚启用 Actions 时补跑一次）
+  workflow_dispatch:
 
 jobs:
   lint:
