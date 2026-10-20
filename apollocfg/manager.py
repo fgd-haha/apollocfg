@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from collections import defaultdict
 from typing import (
@@ -27,6 +29,19 @@ from typing import (
 from apollocfg.client import DEFAULT_NAMESPACE, ApolloClient, ResolvedAssertion
 
 logger = logging.getLogger("apollocfg.manager")
+
+
+def _log_async_result(task: asyncio.Task) -> None:
+    """把异步回调里的异常打出来。
+
+    不取 exception() 的 task 在被 GC 时只会留下一句
+    "Task exception was never retrieved"，丢掉堆栈。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("异步 namespace 回调执行失败: %r", exc)
 
 #: 回调签名 ``(namespace, changes)``
 NamespaceCallback = Callable[[str, Dict[str, Dict[str, Any]]], None]
@@ -59,6 +74,8 @@ class ConfigManager:
         request_timeout: int = 5,
         poll_interval: float = 2.0,
         max_retry_backoff: float = 30.0,
+        refresh_interval: float = 300.0,
+        startup_timeout: Optional[float] = None,
     ) -> None:
         self._client = ApolloClient(
             app_id=app_id,
@@ -79,6 +96,8 @@ class ConfigManager:
             request_timeout=request_timeout,
             poll_interval=poll_interval,
             max_retry_backoff=max_retry_backoff,
+            refresh_interval=refresh_interval,
+            startup_timeout=startup_timeout,
         )
         self._ns_callbacks: Dict[str, List[NamespaceCallback]] = defaultdict(list)
         self._client.register_callback(self._dispatch)
@@ -139,6 +158,48 @@ class ConfigManager:
     def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
         """最终生效的配置：静态兜底值被 Apollo 的值覆盖。"""
         return self._client.effective_configs(namespace)
+
+    def get_content(self, namespace: str) -> Optional[str]:
+        """非 properties 格式 namespace 的原文（json / yaml / xml / txt）。"""
+        return self._client.get_content(namespace)
+
+    def get_json(self, namespace: str) -> Any:
+        """解析 json 格式 namespace 的 content 并返回对象。"""
+        return self._client.get_json(namespace)
+
+    def merged_configs(self, namespaces: Optional[Sequence[str]] = None) -> Dict[str, str]:
+        """跨 namespace 合并，后面的覆盖前面的。"""
+        return self._client.merged_configs(namespaces)
+
+    def on_namespace_change_async(
+        self, namespace: str, loop: asyncio.AbstractEventLoop
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """装饰器：订阅某个 namespace 的变更，回调是协程函数。
+
+        自动桥接到事件循环——变更由长轮询线程检测，协程在循环线程执行。
+        """
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            if not inspect.iscoroutinefunction(cb):
+                raise TypeError(
+                    f"{getattr(cb, '__name__', cb)!r} 不是协程函数，"
+                    "请用 on_namespace_change"
+                )
+
+            def bridge(ns: str, changes: Dict[str, Dict[str, Any]]) -> None:
+                def schedule() -> None:
+                    task = loop.create_task(cb(ns, changes))
+                    task.add_done_callback(_log_async_result)
+
+                try:
+                    loop.call_soon_threadsafe(schedule)
+                except RuntimeError as exc:
+                    logger.warning("事件循环不可用，跳过异步回调 namespace=%s: %s", ns, exc)
+
+            self._ns_callbacks[namespace].append(bridge)
+            return cb
+
+        return decorator
 
     def get_typed(self, namespace: str, model_cls: Type[T]) -> T:
         """用任意模型类解析某个 namespace 的配置。

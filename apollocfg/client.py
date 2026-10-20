@@ -23,9 +23,11 @@ notificationId，无变更则超时返回 304，客户端随即发起下一轮�
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import random
@@ -123,6 +125,8 @@ class ApolloClient:
         request_timeout: int = 5,
         poll_interval: float = 2.0,
         max_retry_backoff: float = 30.0,
+        refresh_interval: float = 300.0,
+        startup_timeout: Optional[float] = None,
     ) -> None:
         if not config_url and not meta_server:
             raise ValueError("config_url 与 meta_server 至少提供一个")
@@ -131,6 +135,13 @@ class ApolloClient:
                 f"poll_timeout({poll_timeout}s) 必须大于服务端长轮询挂起时长"
                 f"({_SERVER_LONG_POLL_SECONDS}s)，否则每轮都会被客户端自己超时掐断"
             )
+        if refresh_interval is not None and 0 < refresh_interval <= poll_interval:
+            raise ValueError(
+                f"refresh_interval({refresh_interval}s) 应大于 poll_interval"
+                f"({poll_interval}s)，否则定时兜底会挤掉长轮询"
+            )
+        if startup_timeout is not None and startup_timeout <= 0:
+            raise ValueError("startup_timeout 必须为正数或 None")
 
         self.app_id = app_id
         self.cluster = cluster
@@ -151,11 +162,21 @@ class ApolloClient:
         self.request_timeout = request_timeout
         self.poll_interval = poll_interval
         self.max_retry_backoff = max_retry_backoff
+        # 定时全量拉取兜底。长轮询可能丢通知（网络抖动、代理吞掉响应），
+        # 届时这是唯一的自愈路径。设 0 或 None 关闭（不建议）。
+        self.refresh_interval = refresh_interval
+        # start() 的总阻塞上界。FastAPI 的 lifespan 卡住意味着探活端口不监听，
+        # 平台会判不健康；Django 则是 worker 起不来。超时后按 allow_fallback
+        # 的设置决定抛错还是降级。None 表示不限制。
+        self.startup_timeout = startup_timeout
 
         self.meta_server = meta_server.rstrip("/") if meta_server else None
         self._config_url = config_url.rstrip("/") if config_url else None
         self._service_pool: List[str] = []
         self._rotations = 0
+        # 上次全量拉取的时刻。start() 里会置为当时时间，所以第一次定时兜底
+        # 发生在启动后 refresh_interval，而不是立刻又拉一遍。
+        self._last_full_refresh = 0.0
 
         self.required_keys = _normalize_keys(required_keys, self.namespaces)
         self.frozen_keys = _normalize_keys(frozen_keys, self.namespaces)
@@ -181,6 +202,7 @@ class ApolloClient:
         self._started = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._refresh_thread: Optional[threading.Thread] = None
         # 串行化 start/stop，避免并发调用产生两个轮询线程，
         # 或 stop() join 超时后 start() 把尚未退出的旧线程"放行"。
         self._lifecycle_lock = threading.RLock()
@@ -189,13 +211,83 @@ class ApolloClient:
 
     # ------------------------- 对外 API -------------------------
     def register_callback(self, cb: ChangeCallback) -> ChangeCallback:
-        """注册配置变更回调。可作装饰器使用。
+        """注册**同步**配置变更回调。可作装饰器使用。
 
         回调拿到的 changes 已剔除 ``frozen_keys``——那些 key 对调用方而言不会变，
         不应该触发任何重建逻辑。
+
+        回调在长轮询线程里执行，**不是**事件循环线程。所以回调内
+        ``asyncio.get_running_loop()`` / ``create_task()`` 都会抛
+        "no running event loop"。异步场景用 :meth:`register_async_callback`。
+
+        Raises:
+            TypeError: 传入了协程函数。协程不会被 await，静默丢弃最难查，
+                所以在注册时就拒绝。
         """
+        if inspect.iscoroutinefunction(cb):
+            raise TypeError(
+                f"{getattr(cb, '__name__', cb)!r} 是协程函数，"
+                "同步回调不会 await 它（协程会被静默丢弃）。"
+                "请改用 register_async_callback(cb, loop=...)"
+            )
         self._callbacks.append(cb)
         return cb
+
+    def register_async_callback(
+        self,
+        cb: Callable[[str, Dict[str, Dict[str, Any]]], Any],
+        loop: asyncio.AbstractEventLoop,
+    ) -> Callable[[str, Dict[str, Dict[str, Any]]], Any]:
+        """注册**异步**配置变更回调，自动桥接到事件循环。
+
+        变更由长轮询线程检测到，而协程必须在事件循环线程里执行。这个方法用
+        ``loop.call_soon_threadsafe`` 做跨线程唤醒——这是 asyncio 为此专门提供的
+        线程安全入口。
+
+        在 FastAPI 的 lifespan 里这样用::
+
+            @asynccontextmanager
+            async def lifespan(app):
+                loop = asyncio.get_running_loop()
+                client.register_async_callback(rebuild_pool, loop=loop)
+                client.start()
+                yield
+                client.stop()
+
+        Args:
+            cb: 协程函数，签名 ``async def cb(namespace, changes)``。
+            loop: 目标事件循环。必须在循环运行的线程里用
+                ``asyncio.get_running_loop()`` 取得。
+        """
+        if not inspect.iscoroutinefunction(cb):
+            raise TypeError(
+                f"{getattr(cb, '__name__', cb)!r} 不是协程函数，直接用 register_callback"
+            )
+
+        def bridge(namespace: str, changes: Dict[str, Dict[str, Any]]) -> None:
+            # 捕获当前参数值；闭包里不要引用循环变量
+            def schedule() -> None:
+                task = loop.create_task(cb(namespace, changes))
+                # 不保留引用的 task 可能被 GC；挂一个回调把异常打出来，
+                # 否则协程里抛异常会变成 "Task exception was never retrieved"
+                task.add_done_callback(self._log_async_callback_result)
+
+            try:
+                loop.call_soon_threadsafe(schedule)
+            except RuntimeError as exc:
+                # 事件循环已关闭（进程正在退出）
+                logger.warning("事件循环不可用，跳过异步回调 namespace=%s: %s", namespace, exc)
+
+        self._callbacks.append(bridge)
+        return cb
+
+    @staticmethod
+    def _log_async_callback_result(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("异步配置变更回调执行失败: %r", exc)
 
     def get_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
         """返回某个 namespace 来自 Apollo 的配置副本（已套用 frozen_keys 快照）。
@@ -214,6 +306,63 @@ class ApolloClient:
             }
             merged.update(snapshot)
             return merged
+
+    def get_content(self, namespace: str) -> Optional[str]:
+        """返回非 properties 格式 namespace 的原文。
+
+        Apollo 对 json / yaml / xml / txt 格式的 namespace 不拆 key-value，而是
+        把整段原文放在 ``configurations.content`` 里。这个方法就是取那段原文。
+
+        注意 namespace 名**必须带后缀**（``database.json`` 而非 ``database``），
+        否则 Apollo 会解析成同名的 properties namespace。
+        """
+        return self.get_configs(namespace).get("content")
+
+    def get_json(self, namespace: str) -> Any:
+        """解析 json 格式 namespace 的 ``content`` 并返回对象。
+
+        适合存放嵌套结构（如 Django 的 ``DATABASES``）：类型原生保留（int/bool/
+        嵌套 dict），且整块原子发布——不会出现"改了 host 漏了密码"的半生效状态。
+
+        代价是 Apollo 的审计、diff、灰度都是 key 粒度的，整块存成一个 ``content``
+        就失去了这些。适合变更频率低、成组变更的配置。
+
+        Raises:
+            ApolloProtocolError: content 不存在或不是合法 JSON。
+        """
+        raw = self.get_content(namespace)
+        if raw is None:
+            raise ApolloProtocolError(
+                f"namespace={namespace} 没有 content 字段"
+                "（确认 namespace 名带了 .json 后缀，且格式确实是 json）"
+            )
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise ApolloProtocolError(
+                f"namespace={namespace} 的 content 不是合法 JSON"
+            ) from exc
+
+    def merged_configs(self, namespaces: Optional[Sequence[str]] = None) -> Dict[str, str]:
+        """跨 namespace 合并，**后面的覆盖前面的**。
+
+        默认按构造时传入的 ``namespaces`` 顺序合并。典型用法是让项目私有配置
+        覆盖关联的公共 namespace::
+
+            ApolloClient(namespaces=["theta.infra", "application"])
+            client.merged_configs()        # application 的同名 key 胜出
+
+        只合并 properties 形态的 namespace；json/yaml 的 ``content`` 不参与
+        （合并两段原文没有意义），用 :meth:`get_json` 单独取。
+        """
+        order = list(namespaces) if namespaces is not None else self.namespaces
+        merged: Dict[str, str] = {}
+        for ns in order:
+            configs = self.get_configs(ns)
+            if set(configs) == {"content"}:
+                continue  # 非 properties 格式，跳过
+            merged.update(configs)
+        return merged
 
     def effective_configs(self, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, str]:
         """返回「最终生效」的配置：静态兜底值被 Apollo 的值覆盖。
@@ -283,18 +432,38 @@ class ApolloClient:
     def _start_locked(self) -> None:
         if self._started:
             return
-        if self._thread is not None and self._thread.is_alive():
-            # 上一轮的线程还没退出（stop() 的 join 超时了）。再起一个会变成
-            # 两个线程同时轮询、重复派发回调，所以先等它真正结束。
-            self._thread.join(timeout=self.poll_timeout + 5)
-            if self._thread.is_alive():
-                raise ApolloError(
-                    "上一轮长轮询线程仍未退出，拒绝重复启动"
-                )
-            self._thread = None
+        # 上一轮的线程还没退出（stop() 的 join 超时了）。再起一个会变成两个
+        # 线程同时跑、重复派发回调，所以先等它们真正结束。
+        for attr, label in (("_thread", "长轮询"), ("_refresh_thread", "定时兜底")):
+            thread: Optional[threading.Thread] = getattr(self, attr)
+            if thread is None or not thread.is_alive():
+                setattr(self, attr, None)
+                continue
+            thread.join(timeout=self.poll_timeout + 5)
+            if thread.is_alive():
+                raise ApolloError(f"上一轮{label}线程仍未退出，拒绝重复启动")
+            setattr(self, attr, None)
 
         failures: Dict[str, Exception] = {}
+        deadline = (
+            time.monotonic() + self.startup_timeout if self.startup_timeout else None
+        )
         for ns in self.namespaces:
+            if deadline is not None and time.monotonic() >= deadline:
+                # 已超出启动预算，剩余 namespace 不再尝试。拖长启动会让探活失败，
+                # 代价比"少拉一个 namespace"更大——后者长轮询起来后会自己补上。
+                remaining = [n for n in self.namespaces if n not in failures and n != ns]
+                failures[ns] = TimeoutError(
+                    f"startup_timeout({self.startup_timeout}s) 耗尽，跳过 {[ns, *remaining]}"
+                )
+                logger.warning(
+                    "启动预算 %.1fs 耗尽，跳过未拉取的 namespace: %s",
+                    self.startup_timeout,
+                    [ns, *remaining],
+                )
+                for n in remaining:
+                    failures[n] = failures[ns]
+                break
             try:
                 self._fetch_namespace(ns, initial=True)
             except Exception as exc:  # noqa: BLE001 - 汇总后按策略统一处理
@@ -347,10 +516,18 @@ class ApolloClient:
 
         self._started = True
         self._stop_event.clear()
+        # 刚拉过全量，定时兜底从现在开始计时
+        self._last_full_refresh = time.monotonic()
         self._thread = threading.Thread(
             target=self._long_poll, name="apollocfg-long-poll", daemon=True
         )
         self._thread.start()
+
+        if self.refresh_interval and self.refresh_interval > 0:
+            self._refresh_thread = threading.Thread(
+                target=self._refresh_loop, name="apollocfg-refresh", daemon=True
+            )
+            self._refresh_thread.start()
         logger.info(
             "Apollo 长轮询已启动 appId=%s cluster=%s namespaces=%s frozen=%d required=%d",
             self.app_id,
@@ -369,21 +546,31 @@ class ApolloClient:
         with self._lifecycle_lock:
             self._stop_event.set()
             self._started = False
-            thread = self._thread
-            if thread is None or not thread.is_alive():
-                self._thread = None
-                return
-            if thread is threading.current_thread():
-                # 在变更回调里调 stop() 会 join 自己，直接抛 RuntimeError
-                logger.warning("在轮询线程内调用 stop()，跳过 join")
-                return
-            thread.join(timeout=timeout)
-            if thread.is_alive():
-                logger.warning(
-                    "长轮询线程在 %.1fs 内未退出，保留引用等待下次 start 时回收", timeout
-                )
-            else:
-                self._thread = None
+            # 两个线程都要回收，且不能因为长轮询线程的状态提前返回而漏掉兜底线程
+            self._join_worker("_thread", "长轮询", timeout)
+            self._join_worker("_refresh_thread", "定时兜底", timeout)
+
+    def _join_worker(self, attr: str, label: str, timeout: float) -> None:
+        """join 一个后台线程并按结果决定是否清掉引用。
+
+        join 超时时**保留**引用——下一次 ``start()`` 需要知道旧线程还活着，
+        否则会出现两个线程同时跑。
+        """
+        thread: Optional[threading.Thread] = getattr(self, attr)
+        if thread is None or not thread.is_alive():
+            setattr(self, attr, None)
+            return
+        if thread is threading.current_thread():
+            # 在变更回调里调 stop() 会 join 自己，直接抛 RuntimeError
+            logger.warning("在%s线程内调用 stop()，跳过 join", label)
+            return
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            logger.warning(
+                "%s线程在 %.1fs 内未退出，保留引用等待下次 start 时回收", label, timeout
+            )
+        else:
+            setattr(self, attr, None)
 
     def __enter__(self) -> ApolloClient:
         self.start()
@@ -880,6 +1067,31 @@ class ApolloClient:
                 if self._stop_event.wait(backoff):
                     break
                 backoff = min(backoff * 2, self.max_retry_backoff)
+
+    def _refresh_loop(self) -> None:
+        """定时全量拉取兜底，跑在**独立线程**里。
+
+        公司对非官方 Apollo 客户端的要求之一（定时主动发起全量拉取），也确实是
+        长轮询丢通知时唯一的自愈路径。
+
+        为什么不放在长轮询循环里：兜底要兜的正是"长轮询出问题"。而长轮询每轮会
+        被服务端挂住约 60s（代理异常时可能到 poll_timeout），把兜底放在同一个
+        循环里，它的触发间隔就被长轮询的节奏绑死了——实测 refresh_interval=8s
+        时实际只能每 61s 执行一次。安全机制不该依赖它要保护的东西。
+        """
+        while not self._stop_event.wait(self.refresh_interval):
+            logger.debug("定时全量拉取（间隔 %.0fs）", self.refresh_interval)
+            for ns in self.namespaces:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    # 清掉 releaseKey 强制拿完整响应，否则服务端会回 304，
+                    # 兜底就失去了意义（它要兜的正是"通知丢了但值其实变了"）。
+                    with self._lock:
+                        self._release_keys.pop(ns, None)
+                    self._fetch_namespace(ns)
+                except Exception as exc:  # noqa: BLE001 - 兜底失败只告警
+                    logger.warning("定时全量拉取失败 namespace=%s: %s", ns, exc)
 
     def _poll_once(self) -> Optional[List[str]]:
         """执行一轮长轮询。

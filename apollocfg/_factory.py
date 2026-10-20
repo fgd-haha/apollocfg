@@ -48,6 +48,8 @@ def create_config_manager(
     request_timeout: int = 5,
     poll_interval: float = 2.0,
     max_retry_backoff: float = 30.0,
+    refresh_interval: float = 300.0,
+    startup_timeout: Optional[float] = None,
 ) -> ConfigManager:
     """以显式参数创建 ConfigManager。
 
@@ -73,6 +75,8 @@ def create_config_manager(
         request_timeout=request_timeout,
         poll_interval=poll_interval,
         max_retry_backoff=max_retry_backoff,
+        refresh_interval=refresh_interval,
+        startup_timeout=startup_timeout,
     )
     if auto_start:
         manager.start()

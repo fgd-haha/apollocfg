@@ -220,6 +220,111 @@ WARN  required_keys 未从 Apollo 解析出值，按 allow_fallback=True 继续;
 `access_key_secret` 同样不会出现在日志里。测试套件里有专门的断言覆盖这一点
 （`tests/test_logging_redaction.py`）。
 
+## 在 asyncio 应用里使用
+
+长轮询跑在独立线程,`requests` 等 socket 时会释放 GIL,所以**同步实现不会阻塞事件
+循环**。实测(10ms 心跳协程量测延迟):
+
+| | p50 | p99 | max | >5ms 尖峰 |
+|---|---|---|---|---|
+| 基线(无 apollocfg) | 0.13ms | 0.22ms | 0.32ms | 0 |
+| 纯 CPU 线程(GIL 争用上界) | 5.41ms | 10.60ms | 11.18ms | 571 |
+| apollocfg(秒回 + 300 key,10ms 一轮) | 0.13ms | 0.75ms | 11.72ms | 1 |
+
+第三行是刻意构造的最坏情况。读配置也是免费的:`get_value()` 只读内存快照,
+实测 1.34µs/次,不发请求。
+
+**但变更回调跑在长轮询线程**,那里没有运行中的事件循环:
+
+```python
+@client.register_callback
+def bad(ns, changes):
+    asyncio.create_task(rebuild())     # RuntimeError: no running event loop
+```
+
+把协程函数传给 `register_callback` 会在**注册时**直接报 `TypeError` —— 协程不被
+await 会被静默丢弃,是最难查的那类 bug,所以库不让它通过。
+
+异步场景用 `register_async_callback`,它用 `loop.call_soon_threadsafe` 做跨线程桥接:
+
+```python
+from contextlib import asynccontextmanager
+
+async def rebuild_pool(namespace, changes):
+    await engine.dispose()             # 真正的异步逻辑，在事件循环里执行
+
+@asynccontextmanager
+async def lifespan(app):
+    loop = asyncio.get_running_loop()
+    client.register_async_callback(rebuild_pool, loop=loop)
+    client.start()
+    yield
+    client.stop()
+```
+
+`ConfigManager` 对应的是 `on_namespace_change_async(namespace, loop=...)`。
+
+### 启动阻塞上界
+
+`start()` 是同步的 —— 它要先拉到配置、校验契约,才能让应用带着正确配置启动。
+Apollo 正常时实测 34~64ms。但 Apollo 慢或不可达时,阻塞时长是
+`request_timeout × namespace 数 × 实例轮换次数`。
+
+这在 FastAPI 的 lifespan 里是个问题:lifespan 卡住意味着端口还没监听,容器平台的
+探活会判不健康。用 `startup_timeout` 封顶:
+
+```python
+ApolloClient(..., startup_timeout=10.0)    # 超预算就跳过剩余 namespace
+```
+
+超时后按 `allow_fallback` 决定抛错还是降级;跳过的 namespace 由长轮询起来后自己补上。
+
+## 定时全量拉取兜底
+
+长轮询可能丢通知 —— 网络抖动、代理吞掉响应、或 notificationId 因某种服务端状态
+不再推进。此时配置会**一直停在旧值且没有任何报错**,定时全量拉取是唯一的自愈路径。
+
+默认每 300 秒一次,跑在**独立线程**:
+
+```python
+ApolloClient(..., refresh_interval=300.0)   # 设 0 关闭（不建议）
+```
+
+为什么是独立线程而不是放在长轮询循环里:兜底要兜的正是"长轮询出问题"。长轮询每轮
+被服务端挂住约 60s,放在同一个循环里,兜底的触发间隔就被长轮询绑死 —— 实测
+`refresh_interval=8` 时实际只能每 61s 执行一次。安全机制不该依赖它要保护的东西。
+
+兜底拉取会先清掉 `releaseKey` 以强制拿到完整响应,否则服务端回 304 就白跑了。
+
+## 非 properties 格式的 namespace
+
+Apollo 对 json / yaml / xml / txt 格式的 namespace **不拆 key-value**,而是把整段
+原文放在 `configurations.content` 里。所以 `get_configs()` 拿到的是 `{"content": "..."}`。
+
+```python
+client = ApolloClient(..., namespaces=["database.json"])
+databases = client.get_json("database.json")    # 解析 content
+raw = client.get_content("database.json")       # 原文
+```
+
+namespace 名**必须带后缀**,写成 `database` 会被解析成同名的 properties namespace。
+
+json 格式适合存嵌套结构(如 Django 的 `DATABASES`):类型原生保留(int/bool/嵌套
+dict),整块原子发布,不会出现"改了 host 漏了密码"的半生效状态。
+
+代价是 Apollo 的审计、diff、灰度都是 key 粒度的,整块存成一个 `content` 就失去了
+这些能力。适合变更频率低、成组变更的配置;单点变更频繁的业务配置用 properties。
+
+## 跨 namespace 合并
+
+```python
+client = ApolloClient(..., namespaces=["theta.infra", "application"])
+client.merged_configs()        # application 的同名 key 覆盖 theta.infra
+```
+
+**后面的覆盖前面的**。典型用法是让项目私有配置覆盖关联的公共 namespace。
+json/yaml 的 `content` 不参与合并(合并两段原文没有意义)。
+
 ## ConfigManager
 
 按 namespace 组织回调的薄封装：
@@ -269,6 +374,7 @@ manager = create_config_manager_from_env()
 | `APOLLO_REQUIRED_KEYS` | 逗号分隔，必须来自 Apollo 的 key | 空 |
 | `APOLLO_FROZEN_KEYS` | 逗号分隔，禁止热更新的 key | 空 |
 | `APOLLO_ALLOW_FALLBACK` | 不可达时是否降级 | `true` |
+| `APOLLO_REQUIRE_RESOLVED_KEYS` | key 缺失时拒绝启动 | `false` |
 
 空白值视为未设置（容器平台常把未配置的变量注入成空串）。`on_resolved` 是可调用对象，
 只能通过参数传入。
@@ -313,6 +419,8 @@ ApolloError
 | `request_timeout` | 普通请求超时 | `5` |
 | `poll_interval` | 异常后首次重试间隔 | `2.0` |
 | `max_retry_backoff` | 退避上限 | `30.0` |
+| `refresh_interval` | 定时全量拉取间隔，0 关闭 | `300.0` |
+| `startup_timeout` | `start()` 阻塞上界，None 不限 | `None` |
 
 ## 测试
 
